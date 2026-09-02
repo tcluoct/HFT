@@ -1,0 +1,23 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "vs2026",
+      "displayName": "Visual Studio 2026 (x64)",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2026"
+    },
+    {
+      "name": "vs2022",
+      "displayName": "Visual Studio 2022 (x64)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022"
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs2026-release", "configurePreset": "vs2026", "configuration": "Release" },
+    { "name": "vs2022-release", "configurePreset": "vs2022", "configuration": "Release" }
+  ]
+}

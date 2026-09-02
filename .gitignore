@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+**/build/
+out/
+bin/
+
+# Crash dumps
+*.dmp
+
+# Generated simulation/session data
+ticklab/session.tkl
+
+# Local tool state
+.claude/settings.local.json
+.gstack/
+
+# Sensitive/internal documents
+附件95-3：外部系统接入报告（程序化）.docx
