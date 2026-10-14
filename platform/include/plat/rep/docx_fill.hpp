@@ -19,12 +19,15 @@
 // Compress-Archive) rather than a vendored DEFLATE codec — see that header
 // for why.
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "plat/core/log.hpp"
 #include "plat/rep/win_paths.hpp"
@@ -52,6 +55,17 @@ struct AccessReportFields {
   bool scope_sub_account = false;      // 是否具备分账户功能
 
   std::optional<std::string> md5_note;  // pre-formatted line to insert under §4, if any
+
+  // A screenshot placeholder to fill: `label` is the exact heading text
+  // (e.g. "\xE7\xA9\xBF\xE9\x80\x8F\xE5\xBC\x8F\xE7\x99\xBB\xE5\xBD\x95"
+  // \xE6\x88\x88\xE5\x9B\xBE — 穿透式登录截图), `image` a local PNG file.
+  struct Screenshot {
+    std::string label;
+    std::filesystem::path image;
+    int width_px = 0;   // from the renderer — needed to size the inline
+    int height_px = 0;  // picture in the document without distorting it
+  };
+  std::vector<Screenshot> screenshots;
 };
 
 namespace docx_detail {
@@ -185,6 +199,129 @@ inline bool insert_paragraph_after(std::string& xml, const std::string& anchor_t
   return true;
 }
 
+// Finds the label's own paragraph, then scans forward (at most `max_scan`
+// paragraphs) for the first one that is genuinely empty — no `<w:r` between
+// its start and its `</w:p>` — mirroring how these placeholders actually
+// look in the template: a heading paragraph, an italic instruction
+// paragraph, then a blank paragraph reserved for a pasted-in screenshot.
+// Returns the offset at which to insert a new run (right after `</w:pPr>`,
+// or right after the paragraph's own opening tag if it has no `<w:pPr>`).
+inline std::optional<std::size_t> find_next_empty_paragraph(const std::string& xml,
+                                                              std::size_t from_pos,
+                                                              int max_scan) {
+  std::size_t pos = from_pos;
+  for (int i = 0; i < max_scan; ++i) {
+    const std::size_t a = xml.find("<w:p>", pos);
+    const std::size_t b = xml.find("<w:p ", pos);
+    const std::size_t p_start = std::min(a, b);
+    if (p_start == std::string::npos) return std::nullopt;
+    const std::size_t p_open_end = xml.find('>', p_start);
+    const std::size_t p_end = xml.find("</w:p>", p_start);
+    if (p_open_end == std::string::npos || p_end == std::string::npos) return std::nullopt;
+
+    const std::string body = xml.substr(p_open_end + 1, p_end - (p_open_end + 1));
+    // A bare "<w:r" substring check also matches "<w:rPr>" (run PROPERTIES,
+    // which every paragraph's own <w:pPr> carries even when empty) — so this
+    // checks for an actual run start ("<w:r>", "<w:r ", "<w:r/>") instead.
+    const bool has_run = body.find("<w:r>") != std::string::npos ||
+                         body.find("<w:r ") != std::string::npos ||
+                         body.find("<w:r/>") != std::string::npos;
+    if (!has_run) {
+      const std::size_t ppr_end = body.find("</w:pPr>");
+      if (ppr_end != std::string::npos)
+        return p_open_end + 1 + ppr_end + std::strlen("</w:pPr>");
+      return p_open_end + 1;  // no <w:pPr> at all — insert right at paragraph start
+    }
+    pos = p_end + std::strlen("</w:p>");
+  }
+  return std::nullopt;
+}
+
+// Inline DrawingML for one picture, referencing relationship `rid` (already
+// added to word/_rels/document.xml.rels and word/media/ by the caller).
+// `xmlns:wp` and `xmlns:r` are declared on the document root already;
+// `xmlns:a`/`xmlns:pic` are not, so they're declared inline here.
+inline std::string build_drawing_run(int pic_num, const std::string& rid, long long cx_emu,
+                                      long long cy_emu) {
+  const std::string id = std::to_string(pic_num);
+  return "<w:r><w:drawing>"
+         "<wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">"
+         "<wp:extent cx=\"" + std::to_string(cx_emu) + "\" cy=\"" + std::to_string(cy_emu) + "\"/>"
+         "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
+         "<wp:docPr id=\"" + id + "\" name=\"Picture " + id + "\"/>"
+         "<wp:cNvGraphicFramePr><a:graphicFrameLocks "
+         "xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" "
+         "noChangeAspect=\"1\"/></wp:cNvGraphicFramePr>"
+         "<a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">"
+         "<a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+         "<pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">"
+         "<pic:nvPicPr><pic:cNvPr id=\"" + id + "\" name=\"Picture " + id + "\"/>"
+         "<pic:cNvPicPr/></pic:nvPicPr>"
+         "<pic:blipFill><a:blip r:embed=\"" + rid + "\"/><a:stretch><a:fillRect/></a:stretch>"
+         "</pic:blipFill>"
+         "<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"" + std::to_string(cx_emu) +
+         "\" cy=\"" + std::to_string(cy_emu) + "\"/></a:xfrm>"
+         "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>"
+         "</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+}
+
+// Finds `label`'s own `<w:t>LABEL</w:t>` run, locates the next empty
+// paragraph after it (see find_next_empty_paragraph), and inserts the
+// picture run there. Returns false (and logs) if the label or an empty
+// paragraph after it can't be found.
+inline bool insert_image_after_label(std::string& xml, const std::string& label, int pic_num,
+                                      const std::string& rid, long long cx_emu, long long cy_emu) {
+  const std::string open1 = "<w:t>" + label + "</w:t>";
+  const std::string open2 = "<w:t xml:space=\"preserve\">" + label + "</w:t>";
+  std::size_t pos = xml.find(open1);
+  if (pos == std::string::npos) pos = xml.find(open2);
+  if (pos == std::string::npos) {
+    logf("[accrep] screenshot label not found: \"%s\" (template may have changed)\n",
+         label.c_str());
+    return false;
+  }
+  const auto insert_at = find_next_empty_paragraph(xml, pos, 4);
+  if (!insert_at) {
+    logf("[accrep] no empty paragraph found after screenshot label \"%s\"\n", label.c_str());
+    return false;
+  }
+  xml.insert(*insert_at, build_drawing_run(pic_num, rid, cx_emu, cy_emu));
+  return true;
+}
+
+// [Content_Types].xml ships with no PNG default — add one, once, right
+// before the existing "rels" default so every embedded picture resolves.
+inline bool ensure_png_content_type(std::string& xml) {
+  if (xml.find("Extension=\"png\"") != std::string::npos) return true;
+  const std::string marker = "<Default Extension=\"rels\"";
+  const std::size_t pos = xml.find(marker);
+  if (pos == std::string::npos) return false;
+  xml.insert(pos, "<Default Extension=\"png\" ContentType=\"image/png\"/>");
+  return true;
+}
+
+// Appends a Relationship for `media_name` (already copied into word/media/)
+// and returns the freshly assigned rId — one past the highest rIdN already
+// present, so it can never collide with the template's own rId1..rId5.
+inline std::string add_image_relationship(std::string& rels_xml, const std::string& media_name) {
+  int max_id = 0;
+  std::size_t pos = 0;
+  while ((pos = rels_xml.find("Id=\"rId", pos)) != std::string::npos) {
+    pos += std::strlen("Id=\"rId");
+    const int n = std::atoi(rels_xml.c_str() + pos);
+    if (n > max_id) max_id = n;
+  }
+  const std::string rid = "rId" + std::to_string(max_id + 1);
+  const std::string entry =
+      "<Relationship Id=\"" + rid +
+      "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" "
+      "Target=\"media/" + media_name + "\"/>";
+  const std::size_t close_pos = rels_xml.rfind("</Relationships>");
+  if (close_pos == std::string::npos) return {};
+  rels_xml.insert(close_pos, entry);
+  return rid;
+}
+
 }  // namespace docx_detail
 
 #ifdef _WIN32
@@ -302,6 +439,53 @@ inline bool fill_access_report(const std::filesystem::path& template_path,
         "\xE7\x9A\x84MD5\xE6\xA0\xA1\xE9\xAA\x8C\xE5\xB7\xA5\xE5\x85\xB7\xE6\x9D\xA5\xE6\x9F"
         "\xA5\xE7\x9C\x8B",  // 可通过官网提供的MD5校验工具来查看
         *f.md5_note);
+
+  if (!f.screenshots.empty()) {
+    const fs::path rels_path = extract_dir / L"word" / L"_rels" / L"document.xml.rels";
+    const fs::path cts_path = extract_dir / L"[Content_Types].xml";
+    const fs::path media_dir = extract_dir / L"word" / L"media";
+    std::string rels_xml = docx_detail::read_file(rels_path);
+    std::string cts_xml = docx_detail::read_file(cts_path);
+    fs::create_directories(media_dir, ec);
+    docx_detail::ensure_png_content_type(cts_xml);
+
+    // Fixed print width (6.3in — fits inside the template's page margins);
+    // height follows the render's own aspect ratio so nothing distorts.
+    constexpr long long kWidthEmu = 5'760'720;
+    int pic_num = 0;
+    for (const auto& shot : f.screenshots) {
+      ++pic_num;
+      if (shot.width_px <= 0 || shot.height_px <= 0) {
+        logf("[accrep] screenshot \"%s\" has no pixel size — skipped\n", shot.label.c_str());
+        ok = false;
+        continue;
+      }
+      std::error_code cp_ec;
+      const std::string media_name = "accshot" + std::to_string(pic_num) + ".png";
+      fs::copy_file(shot.image, media_dir / media_name, fs::copy_options::overwrite_existing,
+                    cp_ec);
+      if (cp_ec) {
+        logf("[accrep] could not copy screenshot \"%s\" into the package: %s\n",
+             shot.label.c_str(), cp_ec.message().c_str());
+        ok = false;
+        continue;
+      }
+      const std::string rid = docx_detail::add_image_relationship(rels_xml, media_name);
+      if (rid.empty()) {
+        logf("[accrep] could not register a relationship for screenshot \"%s\"\n",
+             shot.label.c_str());
+        ok = false;
+        continue;
+      }
+      const long long cy_emu =
+          kWidthEmu * static_cast<long long>(shot.height_px) / static_cast<long long>(shot.width_px);
+      ok &= docx_detail::insert_image_after_label(xml, shot.label, pic_num, rid, kWidthEmu, cy_emu);
+    }
+    if (!docx_detail::write_file(rels_path, rels_xml) || !docx_detail::write_file(cts_path, cts_xml)) {
+      logf("[accrep] could not write updated rels/content-types\n");
+      ok = false;
+    }
+  }
 
   if (!ok) logf("[accrep] one or more fields could not be filled — see warnings above\n");
 

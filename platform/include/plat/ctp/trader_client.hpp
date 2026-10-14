@@ -40,6 +40,7 @@
 #include "plat/codec/msgs.hpp"
 #include "plat/core/types.hpp"
 #include "plat/ctp/conv.hpp"
+#include "plat/ctp/gbk.hpp"
 #include "plat/gw/gateway.hpp"
 #include "plat/oms/oms.hpp"
 
@@ -113,6 +114,7 @@ struct AccountFunds {
   double balance = 0;
   double available = 0;
   double margin = 0;
+  char account_id[16]{};
 };
 
 class TraderClient final : public CThostFtdcTraderSpi {

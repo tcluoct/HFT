@@ -27,6 +27,7 @@ inline const char* risk_check_name(RiskCheck c) {
     case RiskCheck::DuplicateBurst: return "Duplicate";
     case RiskCheck::StaleData: return "StaleData";
     case RiskCheck::KillSwitch: return "KillSwitch";
+    case RiskCheck::TickSize: return "TickSize";
   }
   return "?";
 }
@@ -218,7 +219,7 @@ inline void json_feeds(std::string& o, MirrorShard& sh) {
     jkey(o, "ts"); jts(o, d.ts); o += ',';
     jkey(o, "symbol"); jstr(o, sh.symbol(d.inst)); o += ',';
     jkey(o, "strategy"); o += std::to_string(d.strategy); o += ',';
-    jkey(o, "check"); jstr(o, risk_check_name(d.check)); o += ',';
+    jkey(o, "check"); jstr(o, platops::risk_check_name(d.check)); o += ',';
     jkey(o, "cancel"); o += d.is_cancel ? "true" : "false";
     o += '}';
   }
@@ -250,13 +251,13 @@ inline void json_risk(std::string& o, MirrorShard& sh) {
   jkey(o, "checks");
   o += '{';
   bool first = true;
-  for (int c = 1; c <= 12; ++c) {
+  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c) {
     const std::uint64_t n =
         site ? site->tel().get("risk.deny." + std::to_string(c)) : 0;
     if (n == 0) continue;
     if (!first) o += ',';
     first = false;
-    jkey(o, risk_check_name(static_cast<RiskCheck>(c)));
+    jkey(o, platops::risk_check_name(static_cast<RiskCheck>(c)));
     o += std::to_string(n);
   }
   o += "}}";

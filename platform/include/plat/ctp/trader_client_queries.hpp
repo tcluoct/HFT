@@ -97,7 +97,7 @@ inline AccountFunds TraderClient::query_funds() {
 inline void TraderClient::OnRspQryInstrument(CThostFtdcInstrumentField* in, CThostFtdcRspInfoField* info,
                         int, bool bIsLast) {
   if (info && info->ErrorID != 0) {
-    logf("[td] instrument query error: %d %s\n", info->ErrorID, info->ErrorMsg);
+    logf("[td] instrument query error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     qry_error_ = info->ErrorID;
   }
   if (in && (!info || info->ErrorID == 0) &&
@@ -117,7 +117,7 @@ inline void TraderClient::OnRspQryInstrument(CThostFtdcInstrumentField* in, CTho
 inline void TraderClient::OnRspQryDepthMarketData(CThostFtdcDepthMarketDataField* d, CThostFtdcRspInfoField* info,
                              int, bool bIsLast) {
   if (info && info->ErrorID != 0) {
-    logf("[td] depth query error: %d %s\n", info->ErrorID, info->ErrorMsg);
+    logf("[td] depth query error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     qry_error_ = info->ErrorID;
   }
   // The query can return every instrument on some fronts — filter to ours.
@@ -213,6 +213,7 @@ inline void TraderClient::OnRspQryTradingAccount(CThostFtdcTradingAccountField* 
     qry_funds_.balance = a->Balance;
     qry_funds_.available = a->Available;
     qry_funds_.margin = a->CurrMargin;
+    std::snprintf(qry_funds_.account_id, sizeof(qry_funds_.account_id), "%s", a->AccountID);
   }
   if (bIsLast) finish_query();
 }

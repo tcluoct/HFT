@@ -16,3 +16,10 @@ ticklab/session.tkl
 
 # Sensitive/internal documents
 附件95-3：外部系统接入报告（程序化）.docx
+附件95-3_filled.docx
+accrep_shots/
+
+# Real configs hold account credentials — only the *.example.cfg templates
+# are meant to be committed.
+platform/*.cfg
+!platform/*.example.cfg

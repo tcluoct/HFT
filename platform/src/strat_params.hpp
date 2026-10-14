@@ -79,6 +79,7 @@ inline RiskLimits limits_from(const Config& c) {
   l.cancel_ratio_pct = static_cast<std::uint32_t>(c.i64("risk.cancel_ratio_pct", 80));
   l.price_collar_ticks = static_cast<std::uint32_t>(c.i64("risk.price_collar_ticks", 50));
   l.max_book_age = c.i64("risk.max_book_age_ms", 5'000) * kNsPerMs;
+  l.check_close_position = c.i64("risk.check_close_position", 1) != 0;
   return l;
 }
 

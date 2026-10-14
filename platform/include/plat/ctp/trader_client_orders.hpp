@@ -169,7 +169,7 @@ inline void TraderClient::OnFrontDisconnected(int nReason) {
 inline void TraderClient::OnRspAuthenticate(CThostFtdcRspAuthenticateField*, CThostFtdcRspInfoField* info,
                        int, bool) {
   if (info && info->ErrorID != 0) {
-    logf("[td] authenticate failed: %d %s\n", info->ErrorID, info->ErrorMsg);
+    logf("[td] authenticate failed: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     return;
   }
   CThostFtdcReqUserLoginField f{};
@@ -182,15 +182,15 @@ inline void TraderClient::OnRspAuthenticate(CThostFtdcRspAuthenticateField*, CTh
 inline void TraderClient::OnRspUserLogin(CThostFtdcRspUserLoginField* login, CThostFtdcRspInfoField* info,
                     int, bool) {
   if (info && info->ErrorID != 0) {
-    logf("[td] login failed: %d %s\n", info->ErrorID, info->ErrorMsg);
+    logf("[td] login failed: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     return;
   }
   if (login) {
     front_id_ = login->FrontID;
     session_id_ = login->SessionID;
     trading_day_ = day_from_ctp(login->TradingDay);
-    logf("[td] logged in: trading day %u, front %d session %d\n",
-                 trading_day_, front_id_, session_id_);
+    logf("[td] logged in: broker %s account %s, trading day %u, front %d session %d\n",
+         login->BrokerID, login->UserID, trading_day_, front_id_, session_id_);
   }
   CThostFtdcSettlementInfoConfirmField f{};
   std::snprintf(f.BrokerID, sizeof(f.BrokerID), "%s", cfg_.broker_id.c_str());
@@ -202,7 +202,7 @@ inline void TraderClient::OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoCon
                                 CThostFtdcRspInfoField* info, int, bool) {
   if (info && info->ErrorID != 0) {
     logf("[td] settlement confirm failed: %d %s\n", info->ErrorID,
-                 info->ErrorMsg);
+                 ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     return;
   }
   logf("[td] settlement confirmed — session up\n");
@@ -211,7 +211,7 @@ inline void TraderClient::OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoCon
 }
 
 inline void TraderClient::OnRspError(CThostFtdcRspInfoField* info, int, bool) {
-  if (info) logf("[td] rsp error: %d %s\n", info->ErrorID, info->ErrorMsg);
+  if (info) logf("[td] rsp error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   // A failed request's terminal response can land here instead of the
   // typed callback — wake any pending query as ERRORED, or it would burn
   // its whole timeout in silence (the "counter not ready yet" symptom).
@@ -222,28 +222,28 @@ inline void TraderClient::OnRspError(CThostFtdcRspInfoField* info, int, bool) {
 inline void TraderClient::OnRspOrderInsert(CThostFtdcInputOrderField* input, CThostFtdcRspInfoField* info,
                       int, bool) {
   if (!input || !info || info->ErrorID == 0) return;
-  logf("[td] order insert rejected: %d %s\n", info->ErrorID, info->ErrorMsg);
+  logf("[td] order insert rejected: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   reject_by_ref(input->OrderRef);
 }
 
 inline void TraderClient::OnErrRtnOrderInsert(CThostFtdcInputOrderField* input,
                          CThostFtdcRspInfoField* info) {
   if (!input || !info || info->ErrorID == 0) return;
-  logf("[td] order insert error rtn: %d %s\n", info->ErrorID, info->ErrorMsg);
+  logf("[td] order insert error rtn: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   reject_by_ref(input->OrderRef);
 }
 
 inline void TraderClient::OnRspOrderAction(CThostFtdcInputOrderActionField* action, CThostFtdcRspInfoField* info,
                       int, bool) {
   if (!action || !info || info->ErrorID == 0) return;
-  logf("[td] order action rejected: %d %s\n", info->ErrorID, info->ErrorMsg);
+  logf("[td] order action rejected: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   cancel_reject_by_ref(action->OrderRef);
 }
 
 inline void TraderClient::OnErrRtnOrderAction(CThostFtdcOrderActionField* action,
                          CThostFtdcRspInfoField* info) {
   if (!action || !info || info->ErrorID == 0) return;
-  logf("[td] order action error rtn: %d %s\n", info->ErrorID, info->ErrorMsg);
+  logf("[td] order action error rtn: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   cancel_reject_by_ref(action->OrderRef);
 }
 
@@ -277,7 +277,7 @@ inline void TraderClient::OnRtnOrder(CThostFtdcOrderField* o) {
     ctx.terminal = true;
     if (o->OrderSubmitStatus == THOST_FTDC_OSS_InsertRejected) {
       logf("[td] order %llu rejected by exchange: %s\n",
-                   static_cast<unsigned long long>(seq), o->StatusMsg);
+                   static_cast<unsigned long long>(seq), ctp::gbk_to_utf8(o->StatusMsg).c_str());
       publish_report(make_report(ctx, ExecType::Reject, 0, 0, 0));
     } else {
       publish_report(make_report(ctx, ExecType::Canceled, 0, 0, 0));

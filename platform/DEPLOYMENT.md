@@ -89,6 +89,16 @@ To upgrade the CTP SDK later: replace the four headers in
 and the DLLs in `third_party/ctp/bin/` with a matching set, rebuild, and
 confirm the version with `platd --check`. Never mix DLL and .lib versions.
 
+**评测版 (CP) SDK.** The 期货评测环境 fronts (`:53205` trade / `:53213` md)
+only accept the evaluation build of the API; a production DLL fails the
+handshake with `4040 CTP:API Front shake hand err: decode err`. The broker-
+supplied v6.7.7_CP (20240524, win64) set is vendored in `third_party/ctp_cp/`
+(headers converted GBK → UTF-8, `error.xml` alongside). Select it with
+`cmake -S . -B build/vs2026 -DPLAT_CTP_SDK=cp`; `-DPLAT_CTP_SDK=prod` (the
+default) switches back to `third_party/ctp/`. The cache variable sticks, so
+check the `platform: CTP SDK = ...` configure line before building a
+production binary.
+
 ---
 
 ## 3. Build (on the build machine)

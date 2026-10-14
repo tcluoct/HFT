@@ -20,6 +20,7 @@
 #include "ThostFtdcTraderApi.h"
 #include "plat/core/log.hpp"
 #include "plat/ctp/conv.hpp"
+#include "plat/ctp/gbk.hpp"
 
 namespace plat::rec {
 
@@ -211,7 +212,7 @@ class InstEnumerator final : public CThostFtdcTraderSpi {
     }
   }
   void OnRspError(CThostFtdcRspInfoField* info, int, bool) override {
-    if (info) logf("[enum] rsp error: %d %s\n", info->ErrorID, info->ErrorMsg);
+    if (info) logf("[enum] rsp error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     {
       std::lock_guard lk(mtx_);
       errored_ = true;  // this query was refused — query_all will re-issue it
@@ -230,7 +231,7 @@ class InstEnumerator final : public CThostFtdcTraderSpi {
   }
   static bool err(const CThostFtdcRspInfoField* info, const char* what) {
     if (info && info->ErrorID != 0) {
-      logf("[enum] %s failed: %d %s\n", what, info->ErrorID, info->ErrorMsg);
+      logf("[enum] %s failed: %d %s\n", what, info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
       return true;
     }
     return false;

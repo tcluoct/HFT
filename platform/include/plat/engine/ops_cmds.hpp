@@ -60,7 +60,8 @@ bool apply_ops_command(SiteT& site, AccountId account, const std::string& line, 
     std::string sym, side_s, off_s;
     double px_cny = 0.0;
     std::int64_t lots = 0;
-    if (!(ss >> id >> sym >> side_s >> off_s >> px_cny >> lots) || id == 0 || lots <= 0 ||
+    // id 0 is the unattributed carry-in book — an operator may close it by hand.
+    if (!(ss >> id >> sym >> side_s >> off_s >> px_cny >> lots) || lots <= 0 ||
         px_cny <= 0.0 || (side_s != "buy" && side_s != "sell") ||
         (off_s != "open" && off_s != "close" && off_s != "closetoday")) {
       logf("[ops] usage: order <strat_id> <symbol> buy|sell open|close|closetoday "
@@ -84,8 +85,16 @@ bool apply_ops_command(SiteT& site, AccountId account, const std::string& line, 
                : off_s == "close" ? Offset::CloseYesterday
                                   : Offset::CloseToday;
     site.source(m, now);
-    logf("[ops] order: strategy %u %s %s %s %.4f x %lld (risk-checked)\n", m.strategy,
-         side_s.c_str(), off_s.c_str(), sym.c_str(), px_cny, static_cast<long long>(lots));
+    logf("[ops] order: strategy %u %s %s %s %.4f x %lld (risk-checked) cl_id=0x%016llx\n",
+         m.strategy, side_s.c_str(), off_s.c_str(), sym.c_str(), px_cny,
+         static_cast<long long>(lots),
+         static_cast<unsigned long long>(site.last_manual_order_cl_id()));
+    // Cold path (operator command), so report a risk denial right here
+    // rather than leaving it for the next `status`.
+    if (const RiskDeny& d = site.last_deny(); d.check != RiskCheck{} &&
+                                              d.cl_id == site.last_manual_order_cl_id())
+      logf("[ops] order REJECTED by risk check `%s` — not sent to the counter\n",
+           risk_check_name(d.check));
     return true;
   }
 

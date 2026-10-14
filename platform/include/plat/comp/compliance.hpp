@@ -33,6 +33,12 @@ struct ComplianceThresholds {
   std::uint32_t alert_pct = 80;              // alert at this % of threshold
   std::uint32_t cancel_ratio_alert_pct = 70;
   std::uint32_t cancel_ratio_min_actions = 200;
+  // Plain operator-configured counts, independent of the HFT-designation
+  // math above (§10.2 also wants "tell me at N orders today", not just "tell
+  // me as I approach the regulatory line") — 0 disables each. Fires once,
+  // like every other alert() call.
+  std::uint32_t order_count_alert = 0;
+  std::uint32_t cancel_count_alert = 0;
 };
 
 struct AccountCounters {
@@ -47,6 +53,11 @@ struct AccountCounters {
 class ComplianceEngine {
  public:
   explicit ComplianceEngine(ComplianceThresholds t = {}) : thr_(t) {}
+
+  // Cold-path config, not stream state — same footing as RiskGate's
+  // RiskLimits: replay reconstructs it from the same config file, so it's
+  // never part of save()/load(). Call once at startup, before any events.
+  void set_thresholds(ComplianceThresholds t) { thr_ = t; }
 
   void on_new(const NewOrderReq& r) { note_action(r.account, r.ts, /*cancel=*/false); }
   void on_cancel(const CancelReq& c) { note_action(c.account, c.ts, /*cancel=*/true); }
@@ -163,6 +174,10 @@ class ComplianceEngine {
     if (day_actions >= thr_.cancel_ratio_min_actions &&
         c.day_cancels * 100 >= day_actions * thr_.cancel_ratio_alert_pct)
       alert(a, ts, "cancel ratio elevated");
+    if (!cancel && thr_.order_count_alert && c.day_orders >= thr_.order_count_alert)
+      alert(a, ts, "order count reached configured threshold");
+    if (cancel && thr_.cancel_count_alert && c.day_cancels >= thr_.cancel_count_alert)
+      alert(a, ts, "cancel count reached configured threshold");
   }
 
   template <typename T>

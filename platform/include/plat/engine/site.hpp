@@ -133,6 +133,14 @@ class Site {
   [[nodiscard]] const SiteConfig& config() const noexcept { return cfg_; }
   [[nodiscard]] const InstrumentTable& table() const noexcept { return *table_; }
   [[nodiscard]] SessState session_state() const noexcept { return sess_state_; }
+  // Most recent risk denial (new-order or cancel) — a plain struct copy made
+  // in deny(), no I/O, so it costs nothing on the hot path. `status` (cold,
+  // operator-cadence) is what turns it into a log line; a default-constructed
+  // RiskDeny (check == RiskCheck{}, never a real deny reason) means "none yet".
+  [[nodiscard]] const RiskDeny& last_deny() const noexcept { return last_deny_; }
+  // cl_id of the most recent operator `order` command (risk-passed or not) —
+  // lets the console echo it back so the operator has an id to `cancel`.
+  [[nodiscard]] OrderId last_manual_order_cl_id() const noexcept { return last_manual_cl_id_; }
   // Bank I: every configured instance of the I-th strategy type, in config
   // order (possibly empty, possibly several with different ids/params).
   template <std::size_t I>
@@ -410,6 +418,8 @@ class Site {
   std::uint64_t* c_deny_check_[16] = {};
   LatencyHisto* h_t2t_ = nullptr;
   LatencyHisto* h_rtt_ = nullptr;
+  RiskDeny last_deny_{};
+  OrderId last_manual_cl_id_ = kNoOrder;
   bool books_attached_ = false;
   bool go_ = false;
   PreFlight preflight_result_{};

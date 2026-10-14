@@ -33,7 +33,7 @@ void Site<Gateway, Strats...>::wire_telemetry() {
   c_feed_gap_ = &tel_.counter("feed.gap");
   c_risk_pass_ = &tel_.counter("risk.pass");
   c_risk_deny_ = &tel_.counter("risk.deny");
-  for (int c = 1; c <= 12; ++c)
+  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c)
     c_deny_check_[c] = &tel_.counter("risk.deny." + std::to_string(c));
   h_t2t_ = &tel_.histo("tick_to_trade_ns");
   h_rtt_ = &tel_.histo("order_roundtrip_ns");
@@ -148,7 +148,7 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e) {
       const auto& m = e.as<ManualOrderCmd>();
       dispatching_strategy_ = m.strategy;
       dispatching_account_ = m.account;
-      place(m.inst, m.side, m.offset, m.px, m.qty, Tif::Day, m.ts);
+      last_manual_cl_id_ = place(m.inst, m.side, m.offset, m.px, m.qty, Tif::Day, m.ts);
       dispatching_strategy_ = 0;
       dispatching_account_ = 0;
       break;
@@ -204,6 +204,7 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_cancel_req(const CancelReq& c
     d.is_cancel = 1;
     ++*c_risk_deny_;
     ++*c_deny_check_[static_cast<int>(verdict)];
+    last_deny_ = d;
     dispatch(stream_.seal(cur_ts_, d, Origin::Derived));
   }
 }
@@ -374,6 +375,7 @@ void Site<Gateway, Strats...>::deny(OrderId id, RiskCheck check, const NewOrderR
   d.is_cancel = is_cancel ? 1 : 0;
   ++*c_risk_deny_;
   ++*c_deny_check_[static_cast<int>(check)];
+  last_deny_ = d;
   dispatch(stream_.seal(cur_ts_, d, Origin::Derived));
 }
 

@@ -207,7 +207,7 @@ int main() {
   std::printf("  [diag] entries %d, risk pass %llu deny %llu:", site2.strategies<0>()[0].total_entries(),
               static_cast<unsigned long long>(site2.tel().get("risk.pass")),
               static_cast<unsigned long long>(site2.tel().get("risk.deny")));
-  for (int c = 1; c <= 12; ++c) {
+  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c) {
     const auto n = site2.tel().get("risk.deny." + std::to_string(c));
     if (n) std::printf(" [%d]=%llu", c, static_cast<unsigned long long>(n));
   }

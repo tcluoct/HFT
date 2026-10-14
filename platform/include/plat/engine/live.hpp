@@ -355,6 +355,29 @@ class LiveDriver {
                    static_cast<unsigned long long>(tel.get("risk.pass")),
                    static_cast<unsigned long long>(tel.get("risk.deny")),
                    static_cast<int>(site_->session_state()));
+      // Most recent risk denial, if any — printed here (cold, operator-
+      // triggered) rather than at deny() time, which stays I/O-free (§14).
+      if (const RiskDeny& d = site_->last_deny(); d.check != RiskCheck{}) {
+        const char* sym = site_->table().at(d.inst).symbol;
+        logf("[ops] last deny: %s acct %u strat %u %s %s%s %.4f x %lld\n",
+             risk_check_name(d.check), d.account, d.strategy, sym,
+             d.is_cancel ? "cancel " : "", d.side == Side::Buy ? "buy" : "sell",
+             px_to_cny(d.px), static_cast<long long>(d.qty));
+      }
+      // Reference price the collar check is anchored to, per hosted
+      // instrument — lets an operator pick a legal manual-order price.
+      for (const InstrumentId i : site_->config().hosted) {
+        logf("[ops] ref px %s: %.4f\n", site_->table().at(i).symbol,
+             px_to_cny(site_->risk().reference_px_of(i)));
+      }
+      // Compliance alerts (§10.2) fire once per (account, message) — printed
+      // here each `status` call rather than at alert() time, same cold-path
+      // rule as last_deny above.
+      for (const auto& al : site_->compliance().alerts()) {
+        const auto tp = time_parts(al.ts);
+        logf("[ops] alert %02u:%02u:%02u acct %u: %s\n", tp.hh, tp.mm, tp.ss, al.account,
+             al.what.c_str());
+      }
     } else if (apply_ops_command(*site_, opt_.account, line, now)) {
       // Extended verb (param/order/cancel/transfer): handled + logged there;
       // each is a journaled Source envelope, so it replays and audits.

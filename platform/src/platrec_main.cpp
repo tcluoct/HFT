@@ -42,6 +42,7 @@
 #include "plat/core/thread.hpp"
 #include "plat/core/time.hpp"
 #include "plat/ctp/conv.hpp"
+#include "plat/ctp/gbk.hpp"
 #include "plat/rec/inst_enum.hpp"
 #include "plat/rec/tick_file.hpp"
 #include "plat/rec/tick_merge.hpp"
@@ -128,7 +129,7 @@ class RecMdSpi final : public CThostFtdcMdSpi {
   void OnRspUserLogin(CThostFtdcRspUserLoginField* l, CThostFtdcRspInfoField* info, int,
                       bool) override {
     if (info && info->ErrorID != 0) {
-      logf("[md] login failed: %d %s\n", info->ErrorID, info->ErrorMsg);
+      logf("[md] login failed: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
       return;
     }
     logf("[md] logged in, trading day %s — subscribing %zu instruments\n",
@@ -136,7 +137,7 @@ class RecMdSpi final : public CThostFtdcMdSpi {
     subscribe_all();
   }
   void OnRspError(CThostFtdcRspInfoField* info, int, bool) override {
-    if (info) logf("[md] rsp error: %d %s\n", info->ErrorID, info->ErrorMsg);
+    if (info) logf("[md] rsp error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   }
   // Subscription acks: failures were previously SILENT — an instrument that
   // never subscribed just recorded nothing. Log every rejection; count acks
@@ -145,7 +146,7 @@ class RecMdSpi final : public CThostFtdcMdSpi {
                           int, bool) override {
     if (info && info->ErrorID != 0)
       logf("[md] SUBSCRIBE FAILED %s: %d %s\n", in ? in->InstrumentID : "?", info->ErrorID,
-           info->ErrorMsg);
+           ctp::gbk_to_utf8(info->ErrorMsg).c_str());
     else
       sub_ok_.fetch_add(1, std::memory_order_relaxed);
   }

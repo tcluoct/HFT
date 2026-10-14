@@ -410,6 +410,18 @@ int run_live(const Config& cfg, bool force_resume) {
   LiveSite site(table, sc, LiveSite::Mode::Live, Pack::banks(cfg, table, specs));
   site.set_gateway(&trader);
 
+  // Operator-configured order/cancel-count alerts (§10.2) — off by default;
+  // set comp.order_count_alert / comp.cancel_count_alert to exercise them.
+  if (const auto oca = cfg.i64("comp.order_count_alert", 0);
+      oca || cfg.i64("comp.cancel_count_alert", 0)) {
+    ComplianceThresholds ct;
+    ct.order_count_alert = static_cast<std::uint32_t>(oca);
+    ct.cancel_count_alert = static_cast<std::uint32_t>(cfg.i64("comp.cancel_count_alert", 0));
+    site.compliance().set_thresholds(ct);
+    logf("[platd] compliance alert thresholds: order_count=%u cancel_count=%u\n",
+         ct.order_count_alert, ct.cancel_count_alert);
+  }
+
   // Persist the instrument snapshot next to the journal: replay reconstructs
   // the exact table this session traded with.
   save_sidecar(sc.journal_path, table);
@@ -490,10 +502,10 @@ int run_live(const Config& cfg, bool force_resume) {
   for (const StrategyId id : carried_only) report += pnl_report(site, id, "carried, not running");
   const auto funds = trader.query_funds();
   if (funds.found) {
-    char buf[160];
+    char buf[192];
     std::snprintf(buf, sizeof(buf),
-                  "account funds: balance %.2f available %.2f margin %.2f CNY\n",
-                  funds.balance, funds.available, funds.margin);
+                  "account %s funds: balance %.2f available %.2f margin %.2f CNY\n",
+                  funds.account_id, funds.balance, funds.available, funds.margin);
     report += buf;
   }
   std::printf("%s", report.c_str());

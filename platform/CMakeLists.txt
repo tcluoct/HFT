@@ -109,6 +109,7 @@ set(ACCREP_HEADERS
   include/plat/rep/winproc.hpp
   include/plat/rep/sysinfo.hpp
   include/plat/rep/docx_fill.hpp
+  include/plat/rep/shot_render.hpp
 )
 
 set(PLATD_SOURCES
@@ -132,7 +133,18 @@ set(ACCREP_DOCS accrep.example.cfg)
 # ---------------------------------------------------------------- CTP SDK
 # Official SFIT CTP client libraries (see DEPLOYMENT.md for provenance and
 # version pinning). Headers ship UTF-8; import libs are win64 / linux64.
-set(CTP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctp)
+#   PLAT_CTP_SDK=prod  third_party/ctp     v6.7.11 production API (default)
+#   PLAT_CTP_SDK=cp    third_party/ctp_cp  v6.7.7_CP 评测版 API — required by the
+#                      期货评测环境 fronts (:53205/:53213); a production API
+#                      there fails the handshake with 4040 "decode err".
+set(PLAT_CTP_SDK prod CACHE STRING "CTP SDK flavor: prod or cp (评测版)")
+set_property(CACHE PLAT_CTP_SDK PROPERTY STRINGS prod cp)
+if(PLAT_CTP_SDK STREQUAL "cp")
+  set(CTP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctp_cp)
+else()
+  set(CTP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ctp)
+endif()
+message(STATUS "platform: CTP SDK = ${PLAT_CTP_SDK} (${CTP_DIR})")
 if(WIN32)
   set(CTP_LIBS
     ${CTP_DIR}/lib/thosttraderapi_se.lib

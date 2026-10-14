@@ -225,7 +225,28 @@ enum class RiskCheck : std::uint8_t {
   DuplicateBurst,
   StaleData,
   KillSwitch,
+  TickSize,  // price not a whole multiple of the instrument tick
 };
+
+// Cold-path only (operator console, EOD report) — never called from dispatch.
+constexpr const char* risk_check_name(RiskCheck c) noexcept {
+  switch (c) {
+    case RiskCheck::PhaseGate: return "phase";
+    case RiskCheck::PriceCollar: return "collar";
+    case RiskCheck::SizeNotional: return "size";
+    case RiskCheck::Exposure: return "exposure";
+    case RiskCheck::SellableInventory: return "sellable";
+    case RiskCheck::Margin: return "margin";
+    case RiskCheck::RateLimit: return "rate";
+    case RiskCheck::CancelRatio: return "cancel%";
+    case RiskCheck::SelfTrade: return "self-trade";
+    case RiskCheck::DuplicateBurst: return "dup";
+    case RiskCheck::StaleData: return "stale";
+    case RiskCheck::KillSwitch: return "kill";
+    case RiskCheck::TickSize: return "tick";
+    default: return "-";
+  }
+}
 
 struct RiskDeny {
   OrderId cl_id;

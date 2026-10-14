@@ -35,6 +35,7 @@
 #include "plat/codec/msgs.hpp"
 #include "plat/core/types.hpp"
 #include "plat/ctp/conv.hpp"
+#include "plat/ctp/gbk.hpp"
 
 namespace plat::ctp {
 
@@ -106,7 +107,7 @@ class MdClient final : public CThostFtdcMdSpi {
   void OnRspUserLogin(CThostFtdcRspUserLoginField* login, CThostFtdcRspInfoField* info,
                       int, bool) override {
     if (info && info->ErrorID != 0) {
-      logf("[md] login failed: %d %s\n", info->ErrorID, info->ErrorMsg);
+      logf("[md] login failed: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
       return;
     }
     logf("[md] logged in, trading day %s\n",
@@ -119,11 +120,14 @@ class MdClient final : public CThostFtdcMdSpi {
                           CThostFtdcRspInfoField* info, int, bool) override {
     if (info && info->ErrorID != 0)
       logf("[md] subscribe %s failed: %d %s\n",
-                   inst ? inst->InstrumentID : "?", info->ErrorID, info->ErrorMsg);
+                   inst ? inst->InstrumentID : "?", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
+    else
+      logf("[md] subscribe %s acked — waiting on OnRtnDepthMarketData\n",
+                   inst ? inst->InstrumentID : "?");
   }
 
   void OnRspError(CThostFtdcRspInfoField* info, int, bool) override {
-    if (info) logf("[md] rsp error: %d %s\n", info->ErrorID, info->ErrorMsg);
+    if (info) logf("[md] rsp error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   }
 
   void OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* d) override {

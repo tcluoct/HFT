@@ -30,13 +30,9 @@ std::string session_report(SiteT& site) {
                    tel.get("risk.deny"));
 
   // Risk denials by check id (§10.1 numbering).
-  static constexpr const char* kCheckNames[] = {
-      "-",          "phase",     "collar",    "size",      "exposure", "sellable",
-      "margin",     "rate",      "cancel%",   "self-trade", "dup",      "stale",
-      "kill"};
-  for (int c = 1; c <= 12; ++c) {
+  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c) {
     const auto n = tel.get("risk.deny." + std::to_string(c));
-    if (n) r += std::format("  deny[{}] {}: {}\n", c, kCheckNames[c], n);
+    if (n) r += std::format("  deny[{}] {}: {}\n", c, risk_check_name(static_cast<RiskCheck>(c)), n);
   }
 
   for (const auto& [acct, cc] : site.compliance().accounts()) {

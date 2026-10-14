@@ -49,6 +49,10 @@ struct RiskLimits {
   Nanos max_book_age = 5 * kNsPerSec;        // stale-data interlock
   std::uint32_t duplicate_window = 8;        // identical-order suppression depth (≤16)
   Nanos duplicate_horizon = 20 * kNsPerMs;   // ...within this window (repeat-fire breaker)
+  // Futures close-vs-position check (5b). Off ONLY for counter-error evidence
+  // runs, so a close with nothing to close reaches the counter and its own
+  // 无仓位可平 rejection can be shown; never off in trading configs.
+  bool check_close_position = true;
 };
 
 // check_new/check_cancel return this when every check passes.
@@ -71,6 +75,12 @@ class RiskGate {
   void set_phase(Venue v, Phase p) { phase_[static_cast<std::size_t>(v)] = p; }
   [[nodiscard]] KillSwitch& kill() noexcept { return kill_; }
   [[nodiscard]] const KillSwitch& kill() const noexcept { return kill_; }
+  // Cold-path only (console/ops use): the price the collar check (§10.1 #2)
+  // is currently anchored to for this instrument — last trade, or prev_close
+  // before any book arrives.
+  [[nodiscard]] Price reference_px_of(InstrumentId i) const {
+    return reference_px(i, table_->at(i));
+  }
 
   // Evaluate a new order. RiskCheck return of 0 (as optional) means pass.
   // The engine publishes RiskDeny on failure and forwards on pass.
@@ -90,6 +100,8 @@ class RiskGate {
     // 2) Price collar: inside the limit band AND inside the fat-finger band
     //    around the last traded price.
     if (r.px < in.lower_limit || r.px > in.upper_limit) return RiskCheck::PriceCollar;
+    // 2b) Price must sit on the instrument's tick grid (合约最小变动价位).
+    if (in.tick > 0 && r.px % in.tick != 0) return RiskCheck::TickSize;
     if (const Price ref = reference_px(r.inst, in); ref > 0) {
       const Price band = static_cast<Price>(limits_.price_collar_ticks) * in.tick;
       if (r.px > ref + band || r.px < ref - band) return RiskCheck::PriceCollar;
@@ -114,7 +126,7 @@ class RiskGate {
 
     // 5b) Futures close validation rides the same slot: close-today must fit
     //     today's bucket, close-yesterday yesterday's.
-    if (!in.is_stock() && r.offset != Offset::Open) {
+    if (limits_.check_close_position && !in.is_stock() && r.offset != Offset::Open) {
       const Position* p = pnl_->find(r.account, r.strategy, r.inst);
       const Qty avail = closeable(p, r.side, r.offset);
       if (r.qty > avail) return RiskCheck::SellableInventory;
@@ -176,7 +188,15 @@ class RiskGate {
       h.mix(c.day_cancels);
       for (std::uint32_t k = 0; k < c.count; ++k) h.mix(c.at(k));
     }
-    for (std::uint32_t k = 0; k < dup_count_; ++k) h.mix(dup_at(k));
+    for (std::uint32_t k = 0; k < dup_count_; ++k) {  // field-wise: Recent has padding
+      const Recent& d = dup_at(k);
+      h.mix(d.inst);
+      h.mix(d.px);
+      h.mix(d.qty);
+      h.mix(d.strategy);
+      h.mix(d.side);
+      h.mix(d.ts);
+    }
     return h.value();
   }
 
@@ -426,7 +446,16 @@ class RiskGate {
       dup_head_ = (dup_head_ + 1) % kDupCap;  // evict oldest
       --dup_count_;
     }
-    dup_[(dup_head_ + dup_count_++) % kDupCap] = r;
+    // Zero the slot first: a plain struct copy may carry the temporary's
+    // indeterminate padding into the snapshot bytes save() writes.
+    Recent& slot = dup_[(dup_head_ + dup_count_++) % kDupCap];
+    std::memset(&slot, 0, sizeof(slot));
+    slot.inst = r.inst;
+    slot.px = r.px;
+    slot.qty = r.qty;
+    slot.strategy = r.strategy;
+    slot.side = r.side;
+    slot.ts = r.ts;
   }
 };
 

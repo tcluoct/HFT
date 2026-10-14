@@ -236,6 +236,13 @@ void test_riskgate() {
     CHECK(rig.gate->check_new(rig.order(px_from_cny(78'010.0), 1), at_time(9, 30, 1)) ==
           kRiskPass);
   }
+  {  // off-grid price (tick 10) is refused; on-grid neighbour passes
+    RiskRig rig;
+    CHECK(rig.gate->check_new(rig.order(px_from_cny(78'015.0), 1), at_time(9, 30, 1)) ==
+          RiskCheck::TickSize);
+    CHECK(rig.gate->check_new(rig.order(px_from_cny(78'020.0), 1), at_time(9, 30, 1)) ==
+          kRiskPass);
+  }
   {  // kill switch overrides everything
     RiskRig rig;
     KillSwitchCmd k{};
