@@ -50,8 +50,12 @@ set(PLAT_HEADERS
   include/plat/md/feed.hpp
   include/plat/oms/oms.hpp
   include/plat/pnl/pnl.hpp
+  include/plat/risk/dup_breaker.hpp
   include/plat/risk/kill_switch.hpp
+  include/plat/risk/limits.hpp
   include/plat/risk/riskgate.hpp
+  include/plat/risk/session_guard.hpp
+  include/plat/risk/stock_rules.hpp
   include/plat/comp/compliance.hpp
   include/plat/gw/gateway.hpp
   include/plat/strat/framework.hpp
@@ -220,7 +224,7 @@ set_target_properties(platd PROPERTIES
 # plat_tests — component tests + CTP mapping tests (no counter connection,
 # no linkage against the CTP libs: only conv.hpp's typedefs are included).
 add_executable(plat_tests
-  src/tests_main.cpp src/tests_util.hpp src/tests_components.cpp src/tests_engine.cpp
+  src/tests_main.cpp src/tests_util.hpp src/tests_components.cpp src/tests_risk.cpp src/tests_engine.cpp
   src/tests_recorder.cpp src/tests_signals.cpp src/tests_strats.cpp src/tests_ops.cpp)
 hft_configure(plat_tests)
 target_link_libraries(plat_tests PRIVATE platform_lib)
@@ -290,7 +294,7 @@ add_custom_command(TARGET accrep POST_BUILD
 # under their project (VS lists non-compiled files as "None" items).
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}
              FILES ${PLATD_SOURCES} src/plat_core.cpp src/plat_lib.cpp src/tests_main.cpp
-                   src/tests_components.cpp
+                   src/tests_components.cpp src/tests_risk.cpp
                    src/tests_engine.cpp src/tests_recorder.cpp src/tests_signals.cpp
                    src/tests_strats.cpp src/tests_util.hpp src/bench_main.cpp
                    src/platrec_main.cpp src/platbt_main.cpp src/strat_params.hpp

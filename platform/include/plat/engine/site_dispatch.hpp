@@ -33,7 +33,7 @@ void Site<Gateway, Strats...>::wire_telemetry() {
   c_feed_gap_ = &tel_.counter("feed.gap");
   c_risk_pass_ = &tel_.counter("risk.pass");
   c_risk_deny_ = &tel_.counter("risk.deny");
-  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c)
+  for (int c = 1; c <= static_cast<int>(kRiskCheckLast); ++c)
     c_deny_check_[c] = &tel_.counter("risk.deny." + std::to_string(c));
   h_t2t_ = &tel_.histo("tick_to_trade_ns");
   h_rtt_ = &tel_.histo("order_roundtrip_ns");
@@ -214,6 +214,7 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_exec_report(const Envelope& e
   const auto& r = e.as<ExecReport>();
   oms_.on_exec(r);
   pnl_.on_exec(r);
+  risk_.on_exec(r);
   if (r.type == ExecType::Fill) ++*c_fills_;
   comp_.on_exec(r);
   if (r.trigger_ts && r.type == ExecType::Ack && r.ts >= r.trigger_ts)

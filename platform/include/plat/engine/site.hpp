@@ -415,7 +415,7 @@ class Site {
   std::uint64_t* c_feed_gap_ = nullptr;
   std::uint64_t* c_risk_pass_ = nullptr;
   std::uint64_t* c_risk_deny_ = nullptr;
-  std::uint64_t* c_deny_check_[16] = {};
+  std::uint64_t* c_deny_check_[static_cast<int>(kRiskCheckLast) + 1] = {};
   LatencyHisto* h_t2t_ = nullptr;
   LatencyHisto* h_rtt_ = nullptr;
   RiskDeny last_deny_{};

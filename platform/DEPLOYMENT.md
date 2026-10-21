@@ -3,7 +3,7 @@
 `platd.exe` is the production site daemon for Phase 1 of the platform
 (commodity futures via the CTP counter, per `docs/platform/ARCHITECTURE.md`).
 One process = one venue's instruments on one CTP trading account: market data
-in, momentum strategy, 12-check in-line risk gate, OMS/PnL/compliance, full
+in, momentum strategy, 20-check in-line risk gate, OMS/PnL/compliance, full
 canonical-stream journal, end-of-day reconciliation against the counter.
 
 What you deploy:
@@ -372,7 +372,7 @@ standalone keys). Open `http://127.0.0.1:8848/`.
   cmd file (`shardN.cmd`), which the platd driver polls at 100 ms. Every
   state-changing verb (`param`, `order`, `cancel`, `transfer`, `halt`,
   `flatten`, `disarm`) enters the engine as a **journaled Source envelope**:
-  manual orders pass the full 12-check riskgate, everything replays in the
+  manual orders pass the full 20-check riskgate, everything replays in the
   recovery drill, and the journal is the regulator-grade audit trail of who
   did what when.
 - **Security model:** binds `127.0.0.1` by default and has no auth — treat it
@@ -458,7 +458,7 @@ platbt backtest.cfg day1.mdr day2.mdr ...           # or pass explicit files
 
 `platbt` replays recorded market data through the **exact same** engine and
 strategies platd runs live — `Site<..., SnapMomentum, MeanRevert, Breakout>`,
-the 12-check riskgate, the same books, the same PnL/fee library. Only the
+the 20-check riskgate, the same books, the same PnL/fee library. Only the
 venue is modelled (an IOC fill-against-book simulator) instead of connected,
 so a backtest can never diverge from live behaviour: it *is* the same code,
 and the strategy config uses the identical keys — the same `strategies = ...`

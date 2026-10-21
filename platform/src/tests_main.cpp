@@ -14,6 +14,7 @@ void test_config();
 void test_fut_book();
 void test_oms();
 void test_riskgate();
+void test_risk_desk();
 void test_pnl();
 void test_journal();
 void test_ring();
@@ -53,6 +54,7 @@ int main() {
   test_fut_book();
   test_oms();
   test_riskgate();
+  test_risk_desk();
   test_pnl();
   test_journal();
   test_ring();

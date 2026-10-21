@@ -8,12 +8,18 @@
 // nothing. Book mirrors are dense-id flat arrays (InstrumentIds index the
 // per-day table, symtab-style); the per-second rate window is a fixed-size
 // circular buffer sized by the limit itself (an entry can only exist if it
-// passed the cap); the duplicate breaker is a fixed 16-slot ring. Account
-// counters are a linear-scanned flat vector — a site trades a handful of
-// accounts, and a 3-entry scan beats a map's pointer chase.
+// passed the cap); the duplicate breaker is a fixed 16-slot ring
+// (dup_breaker.hpp). Account counters are a linear-scanned flat vector — a
+// site trades a handful of accounts; a 3-entry scan beats a map's pointer chase.
 //
 // Check order matches ARCHITECTURE.md §10.1's table; each check has a unit
 // test that proves it can fire and, where relevant, that it doesn't misfire.
+// #13–#16 are the risk desk's additions (state in session_guard.hpp): a
+// latched daily stop-loss that still lets the book be closed, the
+// exchanges' per-contract lines (日内开仓限额, 单合约日撤单), and cancel-target
+// hygiene. Cancels under an armed kill scope bypass every throttle — a halt
+// must always be able to pull its resting orders. #17–#20: SSE/SZSE cash-equity
+// rules (stock_rules.hpp) — 申报数量, 价格笼子, ST daily buys, concentration.
 
 #include <array>
 #include <cstdint>
@@ -30,41 +36,24 @@
 #include "plat/md/fut_book.hpp"
 #include "plat/md/stock_book.hpp"
 #include "plat/oms/oms.hpp"
+#include "plat/risk/dup_breaker.hpp"
 #include "plat/risk/kill_switch.hpp"
+#include "plat/risk/limits.hpp"
+#include "plat/risk/session_guard.hpp"
+#include "plat/risk/stock_rules.hpp"
 #include "plat/pnl/pnl.hpp"
 #include "plat/ref/instrument.hpp"
 
 namespace plat {
-
-struct RiskLimits {
-  Qty max_order_qty = 10'000;
-  std::int64_t max_order_notional_e4 = px_from_cny(2'000'000.0);  // 200万 per order
-  std::int64_t max_net_notional_e4 = px_from_cny(10'000'000.0);   // per strategy
-  std::int64_t max_margin_e4 = px_from_cny(5'000'000.0);          // per account
-  std::uint32_t max_actions_per_sec = 250;   // below the 300/s HFT line by default
-  std::uint32_t max_actions_per_day = 18'000;
-  std::uint32_t cancel_ratio_pct = 80;       // cancels/actions ceiling after warmup
-  std::uint32_t cancel_ratio_min_actions = 100;
-  std::uint32_t price_collar_ticks = 50;     // fat-finger band around last/mid
-  Nanos max_book_age = 5 * kNsPerSec;        // stale-data interlock
-  std::uint32_t duplicate_window = 8;        // identical-order suppression depth (≤16)
-  Nanos duplicate_horizon = 20 * kNsPerMs;   // ...within this window (repeat-fire breaker)
-  // Futures close-vs-position check (5b). Off ONLY for counter-error evidence
-  // runs, so a close with nothing to close reaches the counter and its own
-  // 无仓位可平 rejection can be shown; never off in trading configs.
-  bool check_close_position = true;
-};
-
-// check_new/check_cancel return this when every check passes.
-inline constexpr RiskCheck kRiskPass = static_cast<RiskCheck>(0);
 
 class RiskGate {
  public:
   RiskGate(const InstrumentTable& table, const Oms& oms, const PnlLedger& pnl,
            RiskLimits limits)
       : table_(&table), oms_(&oms), pnl_(&pnl), limits_(limits),
-        stock_books_(table.size(), nullptr), fut_books_(table.size(), nullptr) {
-    if (limits_.duplicate_window > kDupCap) limits_.duplicate_window = kDupCap;
+        dup_(limits.duplicate_window, limits.duplicate_horizon), guard_(table.size()),
+        stock_books_(table.size(), nullptr),
+        fut_books_(table.size(), nullptr) {
   }
 
   // Book mirrors: dense-id flat arrays — one indexed load per check, no
@@ -102,13 +91,15 @@ class RiskGate {
     if (r.px < in.lower_limit || r.px > in.upper_limit) return RiskCheck::PriceCollar;
     // 2b) Price must sit on the instrument's tick grid (合约最小变动价位).
     if (in.tick > 0 && r.px % in.tick != 0) return RiskCheck::TickSize;
-    if (const Price ref = reference_px(r.inst, in); ref > 0) {
+    if (const Price ref = reference_px(r.inst, in); ref > 0 && !in.is_stock()) {
       const Price band = static_cast<Price>(limits_.price_collar_ticks) * in.tick;
       if (r.px > ref + band || r.px < ref - band) return RiskCheck::PriceCollar;
     }
 
     // 3) Size / notional caps.
-    if (r.qty <= 0 || r.qty > limits_.max_order_qty) return RiskCheck::SizeNotional;
+    if (r.qty <= 0 ||
+        r.qty > (in.is_stock() ? limits_.max_stock_order_qty : limits_.max_order_qty))
+      return RiskCheck::SizeNotional;
     if (notional_e4(in, r.px, r.qty) > limits_.max_order_notional_e4)
       return RiskCheck::SizeNotional;
 
@@ -132,6 +123,21 @@ class RiskGate {
       if (r.qty > avail) return RiskCheck::SellableInventory;
     }
 
+    // 17–20) Cash-equity exchange rules.
+    if (in.is_stock())
+      if (const RiskCheck v = check_stock(r, in); v != kRiskPass) return v;
+
+    // 13) Daily stop-loss: only orders that add risk are refused.
+    const bool adds = in.is_stock() ? r.side == Side::Buy : r.offset == Offset::Open;
+    if (adds && loss_stopped(r)) return RiskCheck::LossLimit;
+
+    // 14) Per-contract daily open volume, reservation view like #4/#6.
+    if (limits_.max_inst_open_qty > 0 && !in.is_stock() && r.offset == Offset::Open) {
+      const Qty w = working(r, [](const OmsOrder& o) { return o.offset == Offset::Open; });
+      if (guard_.opened(r.account, r.inst) + w + r.qty > limits_.max_inst_open_qty)
+        return RiskCheck::InstOpenLimit;
+    }
+
     // 6) Margin headroom (futures opens). Working open orders reserve margin
     //    at their order prices — an order burst must not pass the cap before
     //    its first fill lands (same discipline as the exposure check; §10.1
@@ -153,10 +159,10 @@ class RiskGate {
 
     // 10) Duplicate/burst breaker: identical order repeated inside the
     //     repeat-fire horizon.
-    if (is_duplicate(r, now)) return RiskCheck::DuplicateBurst;
+    if (dup_.is_duplicate(r, now)) return RiskCheck::DuplicateBurst;
 
     note_action(c, now, /*cancel=*/false);
-    remember(r, now);
+    dup_.remember(r, now);
     return kRiskPass;
   }
 
@@ -166,12 +172,34 @@ class RiskGate {
     const Instrument& in = table_->at(c.inst);
     if (!phase_accepts_cancels(phase_[static_cast<std::size_t>(in.venue)]))
       return RiskCheck::PhaseGate;
+    // 16) The target must be ours, open, and not already being cancelled.
+    if (limits_.check_cancel_target && !cancel_target_ok(c, now)) return RiskCheck::CancelTarget;
     Counters& cnt = counters_for(c.account);
-    if (!rate_ok(cnt, now)) return RiskCheck::RateLimit;
-    if (!cancel_ratio_ok(cnt)) return RiskCheck::CancelRatio;
+    if (kill_.halted(c.account, c.strategy)) [[unlikely]] {
+      // Under an armed scope the throttles step aside: a halt that cannot
+      // pull resting orders because the runaway already burned the cancel
+      // budget (#7/#8/#15) is exactly the failure the kill switch exists to
+      // prevent. Still counted, so the compliance numbers stay true.
+      prune(cnt, now);
+      if (cnt.count == cnt.ring.size()) cnt.pop_front();  // keep the ring bounded
+    } else {
+      if (!rate_ok(cnt, now)) return RiskCheck::RateLimit;
+      if (!cancel_ratio_ok(cnt)) return RiskCheck::CancelRatio;
+      // 15) Per-contract daily cancel line.
+      if (limits_.max_inst_cancels &&
+          guard_.cancels(c.account, c.inst) >= limits_.max_inst_cancels)
+        return RiskCheck::InstCancelLimit;
+    }
     note_action(cnt, now, /*cancel=*/true);
+    guard_.on_cancel_sent(c.account, c.inst, c.cl_id, now);
     return kRiskPass;
   }
+
+  // Execution-report feed (engine dispatch, after OMS/PnL): per-contract
+  // filled opens for #14, in-flight cancel resolution for #16.
+  void on_exec(const ExecReport& e) { guard_.on_exec(e, table_->at(e.inst).is_stock()); }
+
+  [[nodiscard]] const SessionGuard& session() const noexcept { return guard_; }
 
   [[nodiscard]] std::uint32_t day_actions(AccountId a) const {
     for (const auto& c : counters_)
@@ -182,21 +210,14 @@ class RiskGate {
   [[nodiscard]] std::uint64_t state_hash() const {
     StateHash h;
     h.mix(kill_.state_hash());
+    h.mix(guard_.state_hash());
     for (const auto& c : counters_) {
       h.mix(c.account);
       h.mix(c.day_actions);
       h.mix(c.day_cancels);
       for (std::uint32_t k = 0; k < c.count; ++k) h.mix(c.at(k));
     }
-    for (std::uint32_t k = 0; k < dup_count_; ++k) {  // field-wise: Recent has padding
-      const Recent& d = dup_at(k);
-      h.mix(d.inst);
-      h.mix(d.px);
-      h.mix(d.qty);
-      h.mix(d.strategy);
-      h.mix(d.side);
-      h.mix(d.ts);
-    }
+    dup_.mix_into(h);
     return h.value();
   }
 
@@ -219,17 +240,16 @@ class RiskGate {
       append(out, static_cast<std::uint64_t>(c.count));
       for (std::uint32_t k = 0; k < c.count; ++k) append(out, c.at(k));
     }
-    append(out, static_cast<std::uint64_t>(dup_count_));
-    for (std::uint32_t k = 0; k < dup_count_; ++k) append(out, dup_at(k));
+    const auto app = [](std::vector<std::uint8_t>& o, const auto& v) { append(o, v); };
+    dup_.save(out, app);
+    guard_.save(out, app);
   }
   std::size_t load(const std::uint8_t* p, std::size_t avail) {
     counters_.clear();
-    dup_head_ = dup_count_ = 0;
-    std::size_t off = 0;
-    off = kill_.load(p, off, avail,
-                     [](const std::uint8_t* q, std::size_t o, std::size_t a, auto& v) {
-                       return read(q, o, a, v);
-                     });
+    const auto rd = [](const std::uint8_t* q, std::size_t o, std::size_t a, auto& v) {
+      return read(q, o, a, v);
+    };
+    std::size_t off = kill_.load(p, 0, avail, rd);
     for (Phase& ph : phase_) off = read(p, off, avail, ph);
     std::uint64_t n = 0;
     off = read(p, off, avail, n);
@@ -247,13 +267,8 @@ class RiskGate {
         c.push(t);
       }
     }
-    off = read(p, off, avail, n);
-    for (std::uint64_t i = 0; i < n; ++i) {
-      Recent r{};
-      off = read(p, off, avail, r);
-      dup_push(r);
-    }
-    return off;
+    off = dup_.load(p, off, avail, rd);
+    return guard_.load(p, off, avail, rd);
   }
 
  private:
@@ -285,6 +300,71 @@ class RiskGate {
     c.account = a;
     c.ring.resize(limits_.max_actions_per_sec ? limits_.max_actions_per_sec : 1);
     return c;
+  }
+
+  // #13: latched scopes first (empty-vector fast path); the ledger walk only
+  // runs while the scope still trades and a limit is configured.
+  [[nodiscard]] bool loss_stopped(const NewOrderReq& r) {
+    if (guard_.loss_latched(r.account, r.strategy)) [[unlikely]] return true;
+    if (limits_.max_strategy_loss_e4 > 0 &&
+        pnl_->strategy_day_pnl_e4(r.strategy) <= -limits_.max_strategy_loss_e4) {
+      guard_.latch_strategy(r.strategy);
+      return true;
+    }
+    if (limits_.max_account_loss_e4 > 0 &&
+        pnl_->account_day_pnl_e4(r.account) <= -limits_.max_account_loss_e4) {
+      guard_.latch_account(r.account);
+      return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] RiskCheck check_stock(const NewOrderReq& r, const Instrument& in) const {
+    const Qty holding = pnl_->account_holding(r.account, r.inst);
+    // 17) 申报数量.
+    if (!stock_qty_ok(in, r.side, r.qty, holding)) return RiskCheck::StockQty;
+    // 18) 价格笼子, continuous auction only (auctions have no cage).
+    if (limits_.stock_cage_bps && (in.board != Board::Etf || limits_.stock_cage_etf) &&
+        phase_[static_cast<std::size_t>(in.venue)] == Phase::Continuous) {
+      const StockBook* b = stock_books_[r.inst];
+      const StockBook::Top t = b ? b->top() : StockBook::Top{};
+      const Price base = cage_base(r.side, t.bid_px, t.ask_px, t.last_px, in.prev_close);
+      if (!in_price_cage(r.side, r.px, base, in.tick, limits_.stock_cage_bps,
+                         limits_.stock_cage_ticks))
+        return RiskCheck::PriceCage;
+    }
+    if (r.side != Side::Buy) return kRiskPass;
+    const Qty buys = working(r, [](const OmsOrder& o) { return o.side == Side::Buy; });
+    // 19) 风险警示股票 daily buys (filled + working + this).
+    if (in.board == Board::StSpecial && limits_.st_daily_buy_qty > 0 &&
+        guard_.opened(r.account, r.inst) + buys + r.qty > limits_.st_daily_buy_qty)
+      return RiskCheck::StBuyLimit;
+    // 20) Concentration across every book of the account.
+    const Qty after = holding + buys + r.qty;
+    if (limits_.max_stock_holding_qty > 0 && after > limits_.max_stock_holding_qty)
+      return RiskCheck::Concentration;
+    if (limits_.max_stock_holding_e4 > 0) {
+      const Price ref = reference_px(r.inst, in);
+      if (notional_e4(in, ref > r.px ? ref : r.px, after) > limits_.max_stock_holding_e4)
+        return RiskCheck::Concentration;
+    }
+    return kRiskPass;
+  }
+
+  // Leaves of the account's other working orders on r.inst matching `pred`.
+  template <typename Pred>
+  [[nodiscard]] Qty working(const NewOrderReq& r, Pred&& pred) const {
+    Qty q = 0;
+    oms_->for_each_open(r.inst, [&](const OmsOrder& o) {
+      if (o.account == r.account && o.cl_id != r.cl_id && pred(o)) q += o.leaves;
+    });
+    return q;
+  }
+
+  [[nodiscard]] bool cancel_target_ok(const CancelReq& c, Nanos now) const {
+    const OmsOrder* o = oms_->find(c.cl_id);
+    if (!o || !o->open() || o->account != c.account) return false;
+    return !guard_.cancel_in_flight(c.cl_id, now, limits_.cancel_retry_after);
   }
 
   [[nodiscard]] bool book_fresh(InstrumentId i, Nanos now) const {
@@ -373,22 +453,11 @@ class RiskGate {
     return crossed;
   }
 
-  [[nodiscard]] bool is_duplicate(const NewOrderReq& r, Nanos now) const {
-    for (std::uint32_t k = 0; k < dup_count_; ++k) {
-      const Recent& d = dup_at(k);
-      if (now - d.ts > limits_.duplicate_horizon) continue;
-      if (d.inst == r.inst && d.px == r.px && d.qty == r.qty && d.side == r.side &&
-          d.strategy == r.strategy)
-        return true;
-    }
-    return false;
-  }
-  void remember(const NewOrderReq& r, Nanos now) {
-    dup_push({r.inst, r.px, r.qty, r.strategy, r.side, now});
-  }
-
-  [[nodiscard]] bool rate_ok(Counters& c, Nanos now) const {
+  static void prune(Counters& c, Nanos now) noexcept {
     while (c.count && now - c.at(0) >= kNsPerSec) c.pop_front();
+  }
+  [[nodiscard]] bool rate_ok(Counters& c, Nanos now) const {
+    prune(c, now);
     if (c.count >= limits_.max_actions_per_sec) return false;  // cap == ring capacity
     return c.day_actions < limits_.max_actions_per_day;
   }
@@ -420,43 +489,12 @@ class RiskGate {
   const PnlLedger* pnl_;
   RiskLimits limits_;
   KillSwitch kill_;
+  DupBreaker dup_;
+  SessionGuard guard_;
   std::vector<const StockBook*> stock_books_;  // dense-id mirrors, one load per check
   std::vector<const FutBook*> fut_books_;
   Phase phase_[kVenueCount] = {};
   std::vector<Counters> counters_;  // linear scan: a site trades a handful of accounts
-
-  struct Recent {
-    InstrumentId inst;
-    Price px;
-    Qty qty;
-    StrategyId strategy;
-    Side side;
-    Nanos ts;
-  };
-  static constexpr std::uint32_t kDupCap = 16;
-  std::array<Recent, kDupCap> dup_{};
-  std::uint32_t dup_head_ = 0;
-  std::uint32_t dup_count_ = 0;
-
-  [[nodiscard]] const Recent& dup_at(std::uint32_t k) const noexcept {
-    return dup_[(dup_head_ + k) % kDupCap];
-  }
-  void dup_push(const Recent& r) noexcept {
-    if (dup_count_ == limits_.duplicate_window) {
-      dup_head_ = (dup_head_ + 1) % kDupCap;  // evict oldest
-      --dup_count_;
-    }
-    // Zero the slot first: a plain struct copy may carry the temporary's
-    // indeterminate padding into the snapshot bytes save() writes.
-    Recent& slot = dup_[(dup_head_ + dup_count_++) % kDupCap];
-    std::memset(&slot, 0, sizeof(slot));
-    slot.inst = r.inst;
-    slot.px = r.px;
-    slot.qty = r.qty;
-    slot.strategy = r.strategy;
-    slot.side = r.side;
-    slot.ts = r.ts;
-  }
 };
 
 }  // namespace plat

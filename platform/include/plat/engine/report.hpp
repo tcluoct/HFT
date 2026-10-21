@@ -30,7 +30,7 @@ std::string session_report(SiteT& site) {
                    tel.get("risk.deny"));
 
   // Risk denials by check id (§10.1 numbering).
-  for (int c = 1; c <= static_cast<int>(RiskCheck::TickSize); ++c) {
+  for (int c = 1; c <= static_cast<int>(kRiskCheckLast); ++c) {
     const auto n = tel.get("risk.deny." + std::to_string(c));
     if (n) r += std::format("  deny[{}] {}: {}\n", c, risk_check_name(static_cast<RiskCheck>(c)), n);
   }

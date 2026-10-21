@@ -80,6 +80,19 @@ inline RiskLimits limits_from(const Config& c) {
   l.price_collar_ticks = static_cast<std::uint32_t>(c.i64("risk.price_collar_ticks", 50));
   l.max_book_age = c.i64("risk.max_book_age_ms", 5'000) * kNsPerMs;
   l.check_close_position = c.i64("risk.check_close_position", 1) != 0;
+  l.max_strategy_loss_e4 = px_from_cny(c.f64("risk.max_strategy_loss_cny", 0.0));
+  l.max_account_loss_e4 = px_from_cny(c.f64("risk.max_account_loss_cny", 0.0));
+  l.max_inst_open_qty = c.i64("risk.max_inst_open_qty", 0);
+  l.max_inst_cancels = static_cast<std::uint32_t>(c.i64("risk.max_inst_cancels", 450));
+  l.check_cancel_target = c.i64("risk.check_cancel_target", 1) != 0;
+  l.cancel_retry_after = c.i64("risk.cancel_retry_ms", 1'000) * kNsPerMs;
+  l.max_stock_order_qty = c.i64("risk.max_stock_order_qty", 100'000);
+  l.stock_cage_bps = static_cast<std::uint32_t>(c.i64("risk.stock_cage_bps", 200));
+  l.stock_cage_ticks = static_cast<std::uint32_t>(c.i64("risk.stock_cage_ticks", 10));
+  l.stock_cage_etf = c.i64("risk.stock_cage_etf", 0) != 0;
+  l.st_daily_buy_qty = c.i64("risk.st_daily_buy_qty", 500'000);
+  l.max_stock_holding_qty = c.i64("risk.max_stock_holding_qty", 0);
+  l.max_stock_holding_e4 = px_from_cny(c.f64("risk.max_stock_holding_cny", 0.0));
   return l;
 }
 

@@ -52,6 +52,12 @@ struct Position {
   std::int64_t short_cost_e4 = 0;  // futures: open cost of the short book
   std::int64_t realized_e4 = 0;
   std::int64_t fees_e4 = 0;
+  // Carried lots' PnL from cost to prev_close — earned on prior days.
+  // Subtracted from realized+unrealized to give *today's* PnL (逐日盯市),
+  // the quantity the daily stop-loss reads (§10.1 #13). Constant for the
+  // day: closing a carried lot moves its share from unrealized to realized
+  // and the baseline still nets it out.
+  std::int64_t carry_base_e4 = 0;
 
   [[nodiscard]] Qty net() const noexcept {
     return total + (long_yd + long_td) - (short_yd + short_td);
@@ -67,15 +73,23 @@ class PnlLedger {
   void carry_in(AccountId a, StrategyId s, InstrumentId i, Qty stock_qty, Qty fut_long_yd = 0,
                 Qty fut_short_yd = 0, Price cost_px = 0) {
     Position& p = pos_[{a, s, i}];
-    const Price cost = cost_px ? cost_px : table_->at(i).prev_close;
+    const Instrument& in = table_->at(i);
+    const Price cost = cost_px ? cost_px : in.prev_close;
+    // Blend, never overwrite: carry-in can hit the same key twice (an
+    // attributed share plus the unattributed remainder routed to the same
+    // fallback strategy), and the second call must not reprice the first.
+    p.avg_cost_e4 = blend(p.avg_cost_e4, p.total, cost, stock_qty);
+    p.long_cost_e4 = blend(p.long_cost_e4, p.long_yd + p.long_td, cost, fut_long_yd);
+    p.short_cost_e4 = blend(p.short_cost_e4, p.short_yd + p.short_td, cost, fut_short_yd);
     p.total += stock_qty;
     p.sellable += stock_qty;
+    if (stock_qty) hold(a, i) += stock_qty;
     p.long_yd += fut_long_yd;
     p.short_yd += fut_short_yd;
-    p.avg_cost_e4 = cost;
-    if (fut_long_yd) p.long_cost_e4 = cost;
-    if (fut_short_yd) p.short_cost_e4 = cost;
-    marks_[i] = table_->at(i).prev_close;
+    p.carry_base_e4 += (in.prev_close - cost) * stock_qty +
+                       (in.prev_close - cost) * fut_long_yd * in.multiplier +
+                       (cost - in.prev_close) * fut_short_yd * in.multiplier;
+    marks_[i] = in.prev_close;
   }
 
   void on_exec(const ExecReport& e) {
@@ -87,8 +101,12 @@ class PnlLedger {
     p.realized_e4 -= fee;
     marks_[e.inst] = e.px;  // our own print is a mark
 
-    if (in.is_stock()) apply_stock(p, e);
-    else apply_future(p, in, e);
+    if (in.is_stock()) {
+      apply_stock(p, e);
+      hold(e.account, e.inst) += e.side == Side::Buy ? e.qty : -e.qty;
+    } else {
+      apply_future(p, in, e);
+    }
   }
 
   // One indexed store per market print (dense-id flat table) — never a
@@ -125,6 +143,36 @@ class PnlLedger {
     if (lg) u += (mark - p.long_cost_e4) * lg * in.multiplier;
     if (sh) u += (p.short_cost_e4 - mark) * sh * in.multiplier;
     return u;
+  }
+
+  // Cash-equity shares an account holds in one stock across every strategy
+  // book (riskgate #17 odd lots, #20 concentration). Derived from the
+  // ledger: kept current per fill/carry, rebuilt on load(), so it is not
+  // separately hashed. Transfers move shares between books of one account
+  // and leave it unchanged.
+  [[nodiscard]] Qty account_holding(AccountId a, InstrumentId i) const noexcept {
+    for (const AcctHold& h : holds_)
+      if (h.account == a) return h.qty[i];
+    return 0;
+  }
+
+  // Today's PnL net of fees (realized + unrealized − carried baseline).
+  [[nodiscard]] std::int64_t day_pnl_e4(const PosKey& k, const Position& p) const {
+    return p.realized_e4 + unrealized_e4(k, p) - p.carry_base_e4;
+  }
+  // Daily stop-loss inputs (§10.1 #13). Walk the ledger: evaluated only for
+  // position-increasing orders and only when a loss limit is configured.
+  [[nodiscard]] std::int64_t strategy_day_pnl_e4(StrategyId s) const {
+    std::int64_t r = 0;
+    for (const auto& [k, p] : pos_)
+      if (k.strategy == s) r += day_pnl_e4(k, p);
+    return r;
+  }
+  [[nodiscard]] std::int64_t account_day_pnl_e4(AccountId a) const {
+    std::int64_t r = 0;
+    for (const auto& [k, p] : pos_)
+      if (k.account == a) r += day_pnl_e4(k, p);
+    return r;
   }
 
   [[nodiscard]] std::int64_t total_realized_e4(StrategyId s) const {
@@ -182,6 +230,7 @@ class PnlLedger {
       const Qty sellable = n < src.sellable ? n : src.sellable;
       src.sellable -= sellable;
       dst.sellable += sellable;
+      move_base(src, dst, (table_->at(i).prev_close - src.avg_cost_e4) * sellable);
       return n;
     }
     Qty& src_yd = side == Side::Buy ? src.long_yd : src.short_yd;
@@ -196,6 +245,8 @@ class PnlLedger {
     const Qty prior = dst_yd + dst_td;
     dst_cost = (dst_cost * prior + src_cost * n) / (prior + n);
     const Qty from_yd = n < src_yd ? n : src_yd;
+    const std::int64_t per_lot = (table_->at(i).prev_close - src_cost) * table_->at(i).multiplier;
+    move_base(src, dst, (side == Side::Buy ? per_lot : -per_lot) * from_yd);
     src_yd -= from_yd;
     dst_yd += from_yd;
     src_td -= n - from_yd;
@@ -252,6 +303,7 @@ class PnlLedger {
       h.mix(p.short_cost_e4);
       h.mix(p.realized_e4);
       h.mix(p.fees_e4);
+      h.mix(p.carry_base_e4);
     }
     for (InstrumentId i = 0; i < marks_.size(); ++i) {
       if (marks_[i] == 0) continue;
@@ -305,10 +357,34 @@ class PnlLedger {
     }
     off = read(p, off, avail, fut_buy_qty_);
     off = read(p, off, avail, fut_sell_qty_);
+    holds_.clear();
+    for (const auto& [k, v] : pos_)
+      if (v.total) hold(k.account, k.inst) += v.total;
     return off;
   }
 
  private:
+  struct AcctHold {
+    AccountId account;
+    std::vector<Qty> qty;  // dense-id, sized at first touch
+  };
+  Qty& hold(AccountId a, InstrumentId i) {
+    for (AcctHold& h : holds_)
+      if (h.account == a) [[likely]] return h.qty[i];
+    holds_.push_back({a, std::vector<Qty>(table_->size(), 0)});
+    return holds_.back().qty[i];
+  }
+
+  static std::int64_t blend(std::int64_t cost, Qty prior, Price px, Qty add) noexcept {
+    if (add <= 0) return cost;
+    return prior > 0 ? (cost * prior + px * add) / (prior + add) : px;
+  }
+  // Carried lots changing books take their prior-day PnL share with them.
+  static void move_base(Position& src, Position& dst, std::int64_t amount) noexcept {
+    src.carry_base_e4 -= amount;
+    dst.carry_base_e4 += amount;
+  }
+
   void apply_stock(Position& p, const ExecReport& e) {
     if (e.side == Side::Buy) {
       // New cost basis = volume-weighted across the enlarged holding.
@@ -374,6 +450,7 @@ class PnlLedger {
   FeeSchedule fees_;
   std::map<PosKey, Position> pos_;  // cold: touched per fill, not per tick
   std::vector<Price> marks_;        // dense-id last print; 0 = no print yet
+  std::vector<AcctHold> holds_;     // per-account stock holdings (derived)
   Qty fut_buy_qty_ = 0;
   Qty fut_sell_qty_ = 0;
 };

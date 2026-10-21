@@ -226,7 +226,17 @@ enum class RiskCheck : std::uint8_t {
   StaleData,
   KillSwitch,
   TickSize,  // price not a whole multiple of the instrument tick
+  LossLimit,       // daily stop-loss latched: only position-reducing orders pass
+  InstOpenLimit,   // per-contract daily open volume (交易所日内开仓限额)
+  InstCancelLimit, // per-contract daily cancel count (异常交易: 单合约日撤单)
+  CancelTarget,    // cancel of an unknown/terminal order, or one already in flight
+  StockQty,        // 申报数量: board lot / 科创板 200 min / odd-lot sell / per-order max
+  PriceCage,       // 价格笼子: outside base ±2% (or ±10 ticks) in continuous auction
+  StBuyLimit,      // 风险警示股票: daily buys per account per stock (50万股)
+  Concentration,   // per-account single-stock holding cap (shares / notional)
 };
+// Last enumerator — sizes per-check counter tables and report loops.
+inline constexpr RiskCheck kRiskCheckLast = RiskCheck::Concentration;
 
 // Cold-path only (operator console, EOD report) — never called from dispatch.
 constexpr const char* risk_check_name(RiskCheck c) noexcept {
@@ -244,6 +254,14 @@ constexpr const char* risk_check_name(RiskCheck c) noexcept {
     case RiskCheck::StaleData: return "stale";
     case RiskCheck::KillSwitch: return "kill";
     case RiskCheck::TickSize: return "tick";
+    case RiskCheck::LossLimit: return "loss";
+    case RiskCheck::InstOpenLimit: return "inst-open";
+    case RiskCheck::InstCancelLimit: return "inst-cancel";
+    case RiskCheck::CancelTarget: return "cancel-tgt";
+    case RiskCheck::StockQty: return "stock-qty";
+    case RiskCheck::PriceCage: return "cage";
+    case RiskCheck::StBuyLimit: return "st-buy";
+    case RiskCheck::Concentration: return "concentration";
     default: return "-";
   }
 }

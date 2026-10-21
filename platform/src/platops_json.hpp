@@ -28,6 +28,14 @@ inline const char* risk_check_name(RiskCheck c) {
     case RiskCheck::StaleData: return "StaleData";
     case RiskCheck::KillSwitch: return "KillSwitch";
     case RiskCheck::TickSize: return "TickSize";
+    case RiskCheck::LossLimit: return "LossLimit";
+    case RiskCheck::InstOpenLimit: return "InstOpenLimit";
+    case RiskCheck::InstCancelLimit: return "InstCancelLimit";
+    case RiskCheck::CancelTarget: return "CancelTarget";
+    case RiskCheck::StockQty: return "StockQty";
+    case RiskCheck::PriceCage: return "PriceCage";
+    case RiskCheck::StBuyLimit: return "StBuyLimit";
+    case RiskCheck::Concentration: return "Concentration";
   }
   return "?";
 }
