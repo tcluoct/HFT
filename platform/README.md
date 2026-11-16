@@ -4,7 +4,12 @@ The implementation of [docs/platform/ARCHITECTURE.md](../docs/platform/ARCHITECT
 the fourteen labs graduated into one composed system, now with **real venue
 connectivity** — Phase 1 trades commodity futures through the SFIT CTP
 counter. All simulation code has been removed; the venue boundary is the
-production CTP SDK (`third_party/ctp`, v6.7.11).
+production CTP SDK (`third_party/ctp`, v6.7.13 Windows x64).
+
+This project is the **engine and the strategy SDK**. It ships no strategy:
+the deployed lineup is composed by a *desk* project
+([desk/](../desk/)) from the strategy-team static libraries under
+[strategies/](../strategies/), and the platform binaries link that desk.
 
 Deployment (hardware, SDK downloads, broker provisioning, runbook):
 **[DEPLOYMENT.md](DEPLOYMENT.md)**. Config template: `platd.example.cfg`.
@@ -20,14 +25,37 @@ Deployment (hardware, SDK downloads, broker provisioning, runbook):
 | `platbt` | Strategy backtester: replays recorded `.mdr` days through the **same** `Site` + strategies + riskgate + PnL platd runs live (only the venue is a fill simulator), with the identical config keys — so backtest results can't diverge from live. Multi-day: `platbt cfg d1.mdr d2.mdr …`. |
 | `platops` | Web ops console: `platops <cfg>` (same file the fleet runs from) tails every shard's live journal into a Replay-mode **mirror Site** — per-strategy PnL, positions, open orders, fills, risk-limit utilization and alerts reconstructed deterministically a few ms behind live, with zero contact with the trading processes — and drives operator actions (halt/flatten/arm, per-strategy stop, live `param` re-tune, risk-checked manual orders, order cancel, position `transfer` between books) through the per-shard cmd files. Every action enters the engine as a journaled Source envelope: risk-checked, replayable, audited. Loopback-only by default (`ops.port`/`ops.bind`); SSH-tunnel for remote. |
 
-Adding a strategy type = one new header (the strategy + its `Def`
-registration traits, see `plat/engine/pack.hpp`) plus one line appending the
-Def to the `Pack` list in `src/strat_params.hpp`, then rebuilding — parsing,
-bank building and the platd/platbt/--replay compositions are all derived
-from that list. The rebuild is deliberate: every strategy inlines into the
-engine and the tick path carries zero indirection for extensibility's sake —
-a runtime plugin mechanism was evaluated and rejected because its per-event
-virtual hop is a latency tax on exactly the path that matters.
+## Strategy teams and the desk
+
+A hedge fund runs many strategy teams on one execution system. This build
+keeps that separation in the dependency graph, not just in the folder names:
+
+```
+plat_core → strat_sdk → strategies/<team>        (static libs, own tests)
+                 ↑                    ↓
+          platform_lib (engine) → desk → platd / platbt / platops / …
+```
+
+* `strat_sdk` (`platform` project) is everything a team may include: the
+  `plat/sdk/` contract and primitives plus `plat/codec`, `plat/md`, `plat/ref`
+  and `plat/pnl`. A team library links this and **never the engine**.
+* `strategies/` holds one static-library project per team — `trend`, `fade`,
+  `basis`, `cash` — each with its own headers, tests and README. See
+  [strategies/README.md](../strategies/README.md).
+* `desk/` is the composition root: it includes the teams it fields, appends
+  their `Def`s to the `Pack`, and exports `Pack` / `PackSite` /
+  `parse_strategies`. The platform apps link the desk. See
+  [desk/README.md](../desk/README.md).
+
+Adding a strategy type = write the strategy + its `Def` in the owning team's
+library (see the recipe in `plat/engine/pack.hpp`), append the `Def` to the
+`Pack` list in `desk/pack.hpp`, and rebuild — parsing, bank building and the
+platd/platbt/--replay compositions are all derived from that list. The
+platform engine is not edited in that flow. The rebuild is deliberate: every
+strategy inlines into the engine and the tick path carries zero indirection
+for extensibility's sake — a runtime plugin mechanism was evaluated and
+rejected because its per-event virtual hop is a latency tax on exactly the
+path that matters.
 
 ## Measured results (dev VM, Release; see lab notes for the ~200 µs hypervisor outliers)
 
@@ -62,9 +90,10 @@ Measured with `hft::bench_ns_per_op` (signal-fence discipline; MSVC's
 | §7.4 codec/IDL | `plat/codec/msgs.hpp` | wirecodec |
 | §8.1 feed handlers | `plat/ctp/md_client.hpp` (CTP depth → snapshots), `plat/md/feed.hpp` (A/B arbiter, for Phase-2 stock feeds) | feedarb |
 | §8.2 book engines | `plat/md/fut_book.hpp` (snapshot-delta), `plat/md/stock_book.hpp` (order-by-order, Phase 2) | ticklab |
-| §9.1 strategy container | `plat/strat/framework.hpp` | tick2trade |
-| §9.2 signals | `plat/strat/signals.hpp` (tick-path primitives), `plat/strat/kbar.hpp` (k-bar aggregation from snapshot/trade feeds), `plat/strat/indicators.hpp` (bar-cadence ATR/RSI/MACD/rolling stats/VWAP) | sigcalc |
-| §9.3 multi-leg arb | `plat/strat/basisarb.hpp` (Phase-2 federation legs) | sord |
+| §9.1 strategy container | `plat/sdk/framework.hpp` | tick2trade |
+| §9.2 signals | `plat/sdk/signals.hpp` (tick-path primitives), `plat/sdk/kbar.hpp` (k-bar aggregation from snapshot/trade feeds), `plat/sdk/indicators.hpp` (bar-cadence ATR/RSI/MACD/rolling stats/VWAP) | sigcalc |
+| §9.1 strategy teams + desk | `strategies/<team>/` (momentum/breakout, meanrev, basisarb, t0alpha) and `desk/pack.hpp` (the deployed Pack) | tick2trade |
+| §9.3 multi-leg arb | `strategies/basis/include/strat/basis/basisarb.hpp` (Phase-2 federation legs) | sord |
 | §9.4 gateway/session | `plat/gw/gateway.hpp` (boundary), `plat/ctp/trader_client.hpp` (CTP implementation: auth → login → settlement confirm, order entry, reports, queries) | sesslink |
 | §9.5 OMS / PnL | `plat/oms/oms.hpp`, `plat/pnl/pnl.hpp` (T+1 sellable, 平今/平昨 buckets) | omsd, pnld |
 | §9.6 instrument master | `plat/ref/instrument.hpp` — built at startup from counter queries (tick/multiplier/margin/limit band), persisted as the journal's `.ref` sidecar | symtab |

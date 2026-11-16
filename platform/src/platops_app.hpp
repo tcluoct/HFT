@@ -20,13 +20,15 @@
 #include "plat/bus/envelope.hpp"
 #include "plat/core/config.hpp"
 #include "plat/core/types.hpp"
+#include "plat/engine/params.hpp"
 #include "plat/ops/tail.hpp"
 #include "plat/replay/sidecar.hpp"
-#include "strat_params.hpp"
+#include "desk/pack.hpp"
 
 namespace platops {
 
 using namespace platcfg;
+using namespace desk;
 
 // Sink-only gateway: Replay mode never sends, but the Site wants the type.
 struct MirrorGateway {

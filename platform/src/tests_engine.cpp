@@ -1,7 +1,8 @@
 // tests_engine.cpp — engine suite: the full dispatch loop driven through a
-// fake gateway at the production OrderGateway boundary — single- and
-// multi-instrument strategies, three concurrent strategies, Phase-2 compile
-// coverage, crash resume, and the async journal thread.
+// fake gateway at the production OrderGateway boundary — site loop, latency
+// measurement, crash resume, and the async journal thread. Strategy-specific
+// behaviour lives with its team (strategies/<team>/src/tests.cpp); the
+// cross-team composition lives with the desk (desk/src/tests.cpp).
 
 #include <cstring>
 #include <memory>
@@ -9,10 +10,6 @@
 
 #include "plat/bus/journal.hpp"
 #include "plat/replay/replayer.hpp"  // compile coverage: recovery tooling API
-#include "plat/strat/basisarb.hpp"
-#include "plat/strat/breakout.hpp"
-#include "plat/strat/meanrev.hpp"
-#include "plat/strat/t0alpha.hpp"
 #include "tests_util.hpp"
 
 void test_site_loop() {
@@ -92,109 +89,6 @@ void test_site_loop() {
   // EOD reconciliation: venue agrees with our fills, no open orders.
   site.run_eod({}, 1, 0);
   CHECK(site.eod().ran && site.eod().fills_ok && site.eod().order_breaks == 0);
-}
-
-// ------------------------------------- multi-instrument slots (one instance)
-
-void test_momentum_multi_instrument() {
-  InstrumentTable table = one_future();
-  table.add("al2609", Venue::SHFE, Board::Future, px_from_cny(5.0), 1, 5,
-            px_from_cny(20'000.0), 1'000);
-  SiteConfig sc;
-  sc.id = 1;
-  sc.name = "multi";
-  sc.venue = Venue::SHFE;
-  sc.hosted = {0, 1};
-  sc.day = 20'260'713;
-
-  MomentumParams mp;
-  mp.imb_gate_e4 = 1'000;
-  mp.lots = 1;
-  // ONE instance trades both contracts; per-contract state is slots.
-  TestSite site(table, sc, TestSite::Mode::Live,
-                {SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0, 1})});
-  FakeGateway gw;
-  site.set_gateway(&gw);
-
-  PhaseChangeEvt ph{};
-  ph.ts = at_time(9, 0);
-  ph.venue = Venue::SHFE;
-  ph.phase = Phase::Continuous;
-  site.source(ph, ph.ts);
-
-  // Rising cu → entry on instrument 0.
-  site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
-  site.source(snap(0, 2, at_time(9, 0, 2), 78'010, 78'020, 50, 10), at_time(9, 0, 2));
-  CHECK(gw.placed.size() == 1 && gw.placed[0].inst == 0);
-
-  // Falling al with ask pressure → independent short entry on instrument 1,
-  // even while instrument 0 has an order in flight.
-  site.source(snap(1, 1, at_time(9, 0, 3), 20'000, 20'005, 10, 50), at_time(9, 0, 3));
-  site.source(snap(1, 2, at_time(9, 0, 4), 19'995, 20'000, 10, 50), at_time(9, 0, 4));
-  CHECK(gw.placed.size() == 2);
-  CHECK(gw.placed[1].inst == 1 && gw.placed[1].side == Side::Sell);
-}
-
-// ------------------------------------ three concurrent strategies, one site
-
-void test_three_strategies() {
-  using TrioSite = Site<FakeGateway, SnapMomentum, MeanRevert, Breakout>;
-  static_assert(!std::is_polymorphic_v<TrioSite>);
-
-  InstrumentTable table = one_future();
-  SiteConfig sc;
-  sc.id = 1;
-  sc.name = "trio";
-  sc.venue = Venue::SHFE;
-  sc.hosted = {0};
-  sc.day = 20'260'713;
-  RiskLimits wide;  // let all three act in the same window
-  wide.max_actions_per_sec = 1'000;
-  wide.duplicate_horizon = 0;
-  sc.limits = wide;
-
-  MomentumParams mp;
-  mp.imb_gate_e4 = 1'000;
-  MeanRevParams rp;
-  rp.ema_den = 4;  // fast anchor so a stretch shows quickly
-  rp.enter_dev_ticks = 3;
-  rp.imb_gate_e4 = 1'000;
-  BreakoutParams bp;
-  bp.brk_ticks = 1;
-  bp.imb_gate_e4 = 1'000;
-  TrioSite site(table, sc, TrioSite::Mode::Live,
-                {SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0})},
-                {MeanRevert(StrategyId{2}, AccountId{1}, rp, table.size(), {0})},
-                {Breakout(StrategyId{3}, AccountId{1}, bp, table.size(), {0})});
-  FakeGateway gw;
-  site.set_gateway(&gw);
-
-  PhaseChangeEvt ph{};
-  ph.ts = at_time(9, 0);
-  ph.venue = Venue::SHFE;
-  ph.phase = Phase::Continuous;
-  site.source(ph, ph.ts);
-
-  // Baseline, then a strong bid-heavy up-thrust: momentum (delta+imb) AND
-  // breakout (fresh session high) both fire on the SAME event — two orders,
-  // two strategy ids, one dispatch pass. Mean-reversion stays out: the
-  // imbalance agrees with the move, so the fade gate cannot open.
-  site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
-  site.source(snap(0, 2, at_time(9, 0, 2), 78'020, 78'030, 50, 10), at_time(9, 0, 2));
-  CHECK(gw.placed.size() == 2);
-  CHECK(gw.placed[0].strategy != gw.placed[1].strategy);
-  const bool momentum_fired =
-      gw.placed[0].strategy == 1 || gw.placed[1].strategy == 1;
-  const bool breakout_fired =
-      gw.placed[0].strategy == 3 || gw.placed[1].strategy == 3;
-  CHECK(momentum_fired && breakout_fired);
-
-  // Now a stretch far above the anchor with ASK-heavy imbalance: only the
-  // fade can act (momentum needs agreement, breakout needs bid confirm).
-  site.source(snap(0, 3, at_time(9, 0, 3), 78'060, 78'070, 10, 50), at_time(9, 0, 3));
-  CHECK(gw.placed.size() == 3);
-  CHECK(gw.placed[2].strategy == 2);
-  CHECK(gw.placed[2].side == Side::Sell);  // sell rich
 }
 
 // ---------------------------------------------------- crash resume replay
@@ -329,40 +223,6 @@ void test_crash_resume() {
   std::remove(resumed_path);
 }
 
-// ------------------------------------- Phase-2 strategies: compile coverage
-
-// T0Alpha and the arb legs have no live venue yet (stocks / federation are
-// Phase 2). Instantiating them in a Site forces every CRTP handler template
-// to compile, so the dormant code cannot bit-rot while it waits.
-void test_phase2_strategies_compile() {
-  using Phase2Site = Site<FakeGateway, T0Alpha, ArbCashLeg, ArbHedgeLeg>;
-  InstrumentTable table = one_future();
-  table.add("510300", Venue::SSE, Board::Etf, px_from_cny(0.001), 100, 1, px_from_cny(4.0));
-  SiteConfig sc;
-  sc.id = 9;
-  sc.name = "p2";
-  sc.venue = Venue::SSE;
-  sc.hosted = {0, 1};
-  sc.day = 20'260'713;
-  ArbPairParams ap;
-  ap.cash_inst = 1;
-  ap.fut_inst = 0;
-  Phase2Site site(table, sc, Phase2Site::Mode::Live,
-                  {T0Alpha(StrategyId{5}, AccountId{1}, T0Params{}, table.size(), {1})},
-                  {ArbCashLeg(StrategyId{6}, AccountId{1}, {ap}, table.size())},
-                  {ArbHedgeLeg(StrategyId{7}, AccountId{1}, {ap}, table.size())});
-  FakeGateway gw;
-  site.set_gateway(&gw);
-  PhaseChangeEvt ph{};
-  ph.ts = at_time(9, 30);
-  ph.venue = Venue::SSE;
-  ph.phase = Phase::Continuous;
-  site.source(ph, ph.ts);                      // every handler path instantiates
-  site.source(snap(0, 1, at_time(9, 30, 1), 78'000, 78'010), at_time(9, 30, 1));
-  CHECK(site.state_hash() != 0);
-  CHECK(gw.placed.empty());                    // no signals from one snapshot
-}
-
 // -------------------------------------------------- async journal thread
 
 void test_async_journal() {
@@ -398,6 +258,12 @@ void test_async_journal() {
     site.run_eod({}, 0, 0);  // drains the journal ring, seals, joins
     stream_hash = site.stream().stream_hash();
     envelopes = site.tel().get("stream.envelopes");
+    site.refresh_latency();
+    const auto& hist = site.tel().histos();
+    CHECK(hist.at("journal.enqueue_ns").count() == envelopes);
+    CHECK(hist.at("journal.queue_ns").count() == envelopes);
+    CHECK(hist.at("journal.write_batch_ns").count() > 0);
+    CHECK(hist.at("journal.write_batch_ns").count() == hist.at("journal.flush_ns").count());
   }
   // The file the journal THREAD wrote must be exactly the canonical stream:
   // verified checksum, every envelope, hash equal to the engine's. A clean
@@ -413,3 +279,189 @@ void test_async_journal() {
   std::remove(path);
 }
 
+
+namespace {
+Nanos timing_now = 0;
+Nanos test_perf_clock() { timing_now += 10; return timing_now; }
+struct TimedGateway : FakeGateway {
+  void place(const NewOrderReq& r) { timing_now += 1000; FakeGateway::place(r); }
+};
+struct TimedStrategy : Strategy<TimedStrategy> {
+  using Strategy<TimedStrategy>::Strategy;
+  template <typename Ctx> void on_snapshot(Ctx& ctx, const MdSnapshotEvt& s) {
+    timing_now += 200;
+    ctx.place(s.inst, Side::Buy, Offset::Open, s.ask_px[0], 1, Tif::Day, s.ts);
+  }
+};
+}
+
+void test_latency_measurements() {
+  auto table = one_future();
+  SiteConfig cfg;
+  cfg.hosted = {0};
+  cfg.venue = Venue::SHFE;
+  using TimedSite = Site<TimedGateway, TimedStrategy>;
+  auto bank = [&] { return std::vector<TimedStrategy>{
+    TimedStrategy(1, 1),
+    TimedStrategy(2, 1)}; };
+  TimedSite site(table, cfg, TimedSite::Mode::Live, bank());
+  TimedGateway gateway;
+  site.set_gateway(&gateway);
+  site.set_latency_clock(&test_perf_clock);
+  PhaseChangeEvt phase{};
+  phase.venue = Venue::SHFE;
+  phase.phase = Phase::Continuous;
+  phase.ts = at_time(9, 0);
+  timing_now = phase.ts;
+  site.source(phase, phase.ts);
+  auto md = snap(0, 1, phase.ts + 100000, 78000, 78010);
+  timing_now = md.ts + 500; // real input queue delay
+  site.source(md, md.ts, md.ts);
+  const auto& hist = site.tel().histos();
+  CHECK(hist.at("md.queue_ns").count() == 1);
+  CHECK(hist.at("md.queue_ns").max() == 510);
+  CHECK(hist.at("book.update_ns").count() == 1);
+  CHECK(hist.at("order.prepare_ns").count() == 2);
+  CHECK(hist.at("gateway.place_ns").count() == gateway.placed.size());
+  CHECK(hist.at("gateway.place_ns").max() == 1010);
+  CHECK(hist.at("engine.event_ns").count() == 2);
+  CHECK(hist.at("risk.new_order_ns").count() == 2);
+  CHECK(hist.at("risk.new_order_ns").max() == 10);
+  CHECK(hist.at("strategy.1.calc_ns").max() >= 200);
+  CHECK(hist.at("strategy.1.callback_ns").max() > hist.at("strategy.1.calc_ns").max() + 1000);
+  CHECK(hist.at("strategy.2.calc_ns").count() >= 2);
+  CHECK(!gateway.placed.empty());
+  CHECK(hist.at("tick_to_trade_ns").max() >= 1500);
+  if (!gateway.placed.empty()) {
+    const auto request = gateway.placed.front();
+    ExecReport ack{};
+    ack.cl_id = request.cl_id;
+    ack.strategy = request.strategy;
+    ack.inst = request.inst;
+    ack.type = ExecType::Ack;
+    ack.ts = timing_now + 10000;
+    ack.trigger_ts = request.trigger_ts;
+    ack.leaves = request.qty;
+    const auto other_count = hist.at("strategy.2.callback_ns").count();
+    timing_now = ack.ts + 300;
+    site.source(ack, ack.ts, ack.ts);
+    CHECK(hist.at("response.queue_ns").max() == 310);
+    CHECK(hist.at("response.update_ns").count() == 1);
+    CHECK(hist.at("order_roundtrip_ns").count() == 1);
+    CHECK(hist.at("tick_to_ack_ns").max() > hist.at("order_roundtrip_ns").max());
+    CHECK(hist.at("strategy.2.callback_ns").count() == other_count);
+    site.source(ack, ack.ts); // duplicate ack does not double-count RTT
+    CHECK(hist.at("order_roundtrip_ns").count() == 1);
+    site.cancel(request.cl_id);
+    CHECK(hist.at("risk.cancel_ns").count() == 1);
+    CHECK(hist.at("risk.cancel_ns").max() == 10);
+    CHECK(hist.at("cancel.prepare_ns").count() == 1);
+    CHECK(hist.at("gateway.cancel_ns").count() == gateway.cancels.size());
+  }
+  // Measurement clock cannot affect stream or state, nor produce replay samples.
+  TimedSite replay(table, cfg, TimedSite::Mode::Replay, bank());
+  replay.set_latency_clock(&test_perf_clock);
+  replay.source(phase, phase.ts);
+  replay.source(md, md.ts);
+  CHECK(replay.tel().histos().at("risk.new_order_ns").count() == 0);
+  CHECK(replay.tel().histos().at("strategy.1.calc_ns").count() == 0);
+  TimedSite recovery(table, cfg, TimedSite::Mode::Live, bank());
+  recovery.set_recovering(true);
+  recovery.source(phase, phase.ts);
+  recovery.source(md, md.ts);
+  CHECK(recovery.state_hash() == replay.state_hash());
+  CHECK(recovery.tel().histos().at("strategy.1.calc_ns").count() == 0);
+  for (const auto& [name, h] : replay.tel().histos()) CHECK(h.count() == 0);
+  for (const auto& [name, h] : recovery.tel().histos()) CHECK(h.count() == 0);
+  const auto report = latency_report(site.tel());
+  CHECK(report.find("Strategies") != std::string::npos);
+  CHECK(report.find("journal.flush_ns") != std::string::npos);
+  CHECK(report.find("no samples") != std::string::npos);
+}
+
+void test_latency_boundaries() {
+  // Multiple and nested context actions pause calculation exactly once.
+  StrategyCalcTimer timer;
+  CHECK(!timer.pause(5)); // action outside a callback
+  timer.begin(100);
+  const bool outer = timer.pause(120);
+  const bool inner = timer.pause(130);
+  CHECK(outer && !inner);
+  timer.resume(200, inner);
+  timer.resume(250, outer);
+  const bool second = timer.pause(280);
+  timer.resume(400, second);
+  CHECK(timer.finish(450) == 100); // 20 + 30 + 50; engine work excluded
+  CHECK(!timer.pause(500));
+
+  // Overflow and terminal responses cannot attribute an ACK to another order.
+  Telemetry tel;
+  LatencyMetrics metrics;
+  metrics.wire(tel, true);
+  metrics.set_session_clock(&test_perf_clock);
+  metrics.order_sent(1, 100);
+  metrics.order_sent(65537, 200);
+  CHECK(tel.get("latency.correlation_overwrite") == 1);
+  metrics.acknowledgment(1, 50, 500);
+  CHECK(tel.histos().at("order_roundtrip_ns").count() == 0);
+  metrics.acknowledgment(65537, 150, 700);
+  CHECK(tel.histos().at("order_roundtrip_ns").max() == 500);
+  metrics.acknowledgment(65537, 150, 800);
+  CHECK(tel.histos().at("order_roundtrip_ns").count() == 1);
+  metrics.order_sent(2, 900);
+  metrics.terminal(2);
+  metrics.acknowledgment(2, 850, 1000);
+  CHECK(tel.histos().at("order_roundtrip_ns").count() == 1);
+
+  // Transport timestamps are paired atomically with the correct payload,
+  // including concurrent publication. They never alter canonical bytes.
+  Ring ring(8192);
+  Ring::Writer writer(ring);
+  Ring::Reader reader(ring, true, Ring::LossPolicy::Intolerant);
+  std::thread producer([&] {
+    for (std::uint64_t i = 0; i < 4096; ++i) {
+      const auto md = snap(0, i, 100, 78000, 78010);
+      writer.publish(make_envelope(i, 100, md, Origin::Source, 1), 1000 + i);
+    }
+  });
+  for (std::uint64_t i = 0; i < 4096;) {
+    Envelope out{};
+    Nanos received = 0;
+    const auto result = reader.poll(out, &received);
+    if (result.kind == Ring::PollKind::Empty) { std::this_thread::yield(); continue; }
+    CHECK(result.kind == Ring::PollKind::Msg);
+    if (result.kind != Ring::PollKind::Msg) break;
+    CHECK(received == static_cast<Nanos>(1000 + i));
+    CHECK(out.as<MdSnapshotEvt>().feed_seq == i);
+    const auto expected = make_envelope(i, 100, out.as<MdSnapshotEvt>(), Origin::Source, 1);
+    CHECK(std::memcmp(&out, &expected, sizeof(out)) == 0);
+    ++i;
+  }
+  producer.join();
+  // Untimed publishers clear metadata, including a reused slot.
+  Ring small(1);
+  Ring::Writer sw(small);
+  Ring::Reader sr(small);
+  const auto md = snap(0, 0, 100, 78000, 78010);
+  const auto env = make_envelope(0, 100, md, Origin::Source, 1);
+  Envelope out{};
+  Nanos received = 0;
+  sw.publish(env, 999);
+  CHECK(sr.poll(out, &received).kind == Ring::PollKind::Msg && received == 999);
+  sw.publish(env);
+  CHECK(sr.poll(out, &received).kind == Ring::PollKind::Msg && received == 0);
+
+  const char* path = "plat_latency_recovery_test.jnl";
+  AsyncJournal journal;
+  CHECK(journal.open(path, 20260713, 1));
+  journal.set_latency_enabled(false);
+  journal.append(env);
+  journal.finish();
+  const auto snapshot = journal.timing_snapshot();
+  CHECK(snapshot.enqueue.count() == 0 && snapshot.queue.count() == 0);
+  CHECK(snapshot.write_batch.count() == 0 && snapshot.flush.count() == 0);
+  JournalReader persisted;
+  CHECK(persisted.open(path) && persisted.verified());
+  CHECK(persisted.header().count == 1);
+  std::remove(path);
+}

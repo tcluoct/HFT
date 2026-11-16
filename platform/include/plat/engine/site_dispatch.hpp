@@ -35,33 +35,44 @@ void Site<Gateway, Strats...>::wire_telemetry() {
   c_risk_deny_ = &tel_.counter("risk.deny");
   for (int c = 1; c <= static_cast<int>(kRiskCheckLast); ++c)
     c_deny_check_[c] = &tel_.counter("risk.deny." + std::to_string(c));
-  h_t2t_ = &tel_.histo("tick_to_trade_ns");
-  h_rtt_ = &tel_.histo("order_roundtrip_ns");
+  latency_.wire(tel_, mode_ == Mode::Live);
+  const auto wire_bank = [&](auto& bank) {
+    for (const auto& strategy : bank) latency_.add_strategy(tel_, strategy.id());
+  };
+  std::apply([&](auto&... bank) { (wire_bank(bank), ...); }, strats_);
 }
 
 template <OrderGateway Gateway, AnyStrategy... Strats>
-void Site<Gateway, Strats...>::dispatch(const Envelope& e) {
+void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_begin) {
   cur_ts_ = e.ts;
   ++*c_envelopes_;
   switch (e.schema) {
     case Schema::MdSnapshot: {
       const auto& m = e.as<MdSnapshotEvt>();
+      const auto begin = latency_.now();
       if (m.last_px) pnl_.mark(m.inst, m.last_px);
       if (has_fut_[m.inst]) [[likely]] fut_books_[m.inst].on_snapshot(m);
+      latency_.record(LatencyStage::BookUpdate, begin, latency_.now());
       route(e);
       break;
     }
     case Schema::MdOrder: {
       const auto& m = e.as<MdOrderEvt>();
-      if (StockBook* b = stock_books_[m.inst].get())
-        if (b->on_order(m)) publish_top(m.inst, m.ts);
+      const auto begin = latency_.now();
+      StockBook* b = stock_books_[m.inst].get();
+      const bool changed = b && b->on_order(m);
+      latency_.record(LatencyStage::BookUpdate, begin, latency_.now());
+      if (changed) publish_top(m.inst, m.ts);
       break;  // book deltas surface to strategies as BookTopEvt
     }
     case Schema::MdTrade: {
       const auto& m = e.as<MdTradeEvt>();
+      const auto begin = latency_.now();
       pnl_.mark(m.inst, m.px);
-      if (StockBook* b = stock_books_[m.inst].get())
-        if (b->on_trade(m)) publish_top(m.inst, m.ts);
+      StockBook* b = stock_books_[m.inst].get();
+      const bool changed = b && b->on_trade(m);
+      latency_.record(LatencyStage::BookUpdate, begin, latency_.now());
+      if (changed) publish_top(m.inst, m.ts);
       route(e);
       break;
     }
@@ -81,7 +92,7 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e) {
       route(e);
       break;
     case Schema::NewOrderReq:
-      on_new_order(e.as<NewOrderReq>());
+      on_new_order(e.as<NewOrderReq>(), order_prepare_begin);
       break;
     case Schema::CancelReq:
       on_cancel_req(e.as<CancelReq>());
@@ -169,19 +180,29 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e) {
 }
 
 template <OrderGateway Gateway, AnyStrategy... Strats>
-HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_new_order(const NewOrderReq& r) {
+HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_new_order(const NewOrderReq& r, Nanos prepare_begin) {
   // OMS first: the order exists before its fate is decided, and riskgate's
   // open-order reads must exclude the in-flight request itself.
+  if (!prepare_begin) prepare_begin = latency_.now();
   oms_.on_new(r);
+  latency_.record(LatencyStage::OrderPrepare, prepare_begin, latency_.now());
+  const auto risk_start = latency_.now();
   const RiskCheck verdict = risk_.check_new(r, cur_ts_);
+  const auto risk_end = latency_.now();
+  latency_.record(LatencyStage::RiskNew, risk_start, risk_end);
   if (verdict == kRiskPass) [[likely]] {
-    // Gateway first — the wire outranks our own bookkeeping (§12.2);
-    // telemetry and compliance accounting happen behind the send.
-    if (mode_ == Mode::Live && gw_ && !recovering_) gw_->place(r);
+    // Submit before compliance accounting. Timestamp capture is explicit
+    // at the gateway boundary; API return is not a NIC transmit timestamp.
+    if (mode_ == Mode::Live && gw_ && !recovering_) {
+      const auto sent = latency_.now();
+      latency_.order_sent(r.cl_id, sent);
+      gw_->place(r);
+      const auto submitted = latency_.now();
+      latency_.record(LatencyStage::GatewayNew, sent, submitted);
+      latency_.order_submitted(r.trigger_ts, submitted);
+    }
     ++*c_risk_pass_;
     comp_.on_new(r);
-    if (cur_ts_ >= r.trigger_ts)
-      h_t2t_->record(static_cast<std::uint64_t>(cur_ts_ - r.trigger_ts));
   } else {
     deny(r.cl_id, verdict, r, false);
   }
@@ -189,9 +210,16 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_new_order(const NewOrderReq& 
 
 template <OrderGateway Gateway, AnyStrategy... Strats>
 HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_cancel_req(const CancelReq& c) {
+  const auto risk_start = latency_.now();
   const RiskCheck verdict = risk_.check_cancel(c, cur_ts_);
+  const auto risk_end = latency_.now();
+  latency_.record(LatencyStage::RiskCancel, risk_start, risk_end);
   if (verdict == kRiskPass) [[likely]] {
-    if (mode_ == Mode::Live && gw_ && !recovering_) gw_->cancel(c);
+    if (mode_ == Mode::Live && gw_ && !recovering_) {
+      const auto sent = latency_.now();
+      gw_->cancel(c);
+      latency_.record(LatencyStage::GatewayCancel, sent, latency_.now());
+    }
     comp_.on_cancel(c);
   } else {
     RiskDeny d{};
@@ -212,16 +240,19 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_cancel_req(const CancelReq& c
 template <OrderGateway Gateway, AnyStrategy... Strats>
 HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_exec_report(const Envelope& e) {
   const auto& r = e.as<ExecReport>();
+  const auto update_begin = latency_.now();
   oms_.on_exec(r);
   pnl_.on_exec(r);
   risk_.on_exec(r);
   if (r.type == ExecType::Fill) ++*c_fills_;
   comp_.on_exec(r);
-  if (r.trigger_ts && r.type == ExecType::Ack && r.ts >= r.trigger_ts)
-    h_rtt_->record(static_cast<std::uint64_t>(r.ts - r.trigger_ts));
+  if (r.type == ExecType::Ack) latency_.acknowledgment(r.cl_id, r.trigger_ts, r.ts);
+  else if (r.type == ExecType::Reject || r.type == ExecType::Canceled ||
+           (r.type == ExecType::Fill && r.leaves == 0)) latency_.terminal(r.cl_id);
   // Own-order queue tracking in stock books: acks carry venue numbers.
   if (r.type == ExecType::Ack && r.venue_no != 0)
     if (StockBook* b = stock_books_[r.inst].get()) b->track_own(r.venue_no);
+  latency_.record(LatencyStage::ResponseUpdate, update_begin, latency_.now());
   route(e);
 }
 
@@ -273,8 +304,21 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::deliver_bank(Bank& bank, const E
 template <OrderGateway Gateway, AnyStrategy... Strats>
 template <typename S>
 HFT_FORCE_INLINE void Site<Gateway, Strats...>::deliver_one(S& s, const Envelope& e) {
+  // Targeted events must not create samples for unrelated instances.
+  switch (e.schema) {
+    case Schema::ExecReport: if (e.as<ExecReport>().strategy != s.id()) return; break;
+    case Schema::RiskDeny: if (e.as<RiskDeny>().strategy != s.id()) return; break;
+    case Schema::Timer: if (e.as<TimerEvt>().strategy != s.id()) return; break;
+    case Schema::ParamUpdate: if (e.as<ParamUpdateEvt>().strategy != s.id()) return; break;
+    case Schema::BookTop: case Schema::MdTrade: case Schema::MdSnapshot:
+    case Schema::PhaseChange: case Schema::HedgeIntent: case Schema::BasisSummary:
+    case Schema::HedgeDone: break;
+    default: return;
+  }
   dispatching_strategy_ = s.id();
   dispatching_account_ = s.account();
+  const auto begin = latency_.now();
+  strategy_timer_.begin(begin);
   switch (e.schema) {
     case Schema::BookTop: s.on_book(*this, e.as<BookTopEvt>()); break;
     case Schema::MdTrade: s.on_trade(*this, e.as<MdTradeEvt>()); break;
@@ -305,6 +349,9 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::deliver_one(S& s, const Envelope
     }
     default: break;
   }
+  const auto end = latency_.now();
+  const auto calculation = strategy_timer_.finish(end);
+  latency_.record_strategy(s.id(), begin, end, calculation);
 }
 
 template <OrderGateway Gateway, AnyStrategy... Strats>

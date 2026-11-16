@@ -28,8 +28,8 @@
 //
 // now() inside components is always the timestamp of the envelope being
 // dispatched — never a wall clock — which is the entire determinism story.
-// The wall clock exists only in the live driver, where it stamps Source
-// envelopes as they cross the boundary.
+// Performance clocks are used only for telemetry; their readings never
+// enter strategy decisions, envelopes, or deterministic state.
 
 #include <cstdint>
 #include <cstdio>
@@ -55,8 +55,8 @@
 #include "plat/ref/fees.hpp"
 #include "plat/ref/instrument.hpp"
 #include "plat/risk/riskgate.hpp"
-#include "plat/strat/framework.hpp"
-#include "plat/tel/telemetry.hpp"
+#include "plat/sdk/framework.hpp"
+#include "plat/tel/latency.hpp"
 
 namespace plat {
 
@@ -116,11 +116,18 @@ class Site {
     timer_ctx_ = ctx;
   }
 
+  // Must share the live adapters' session-time epoch; never changes now().
+  void set_latency_clock(PerfClock clock) { latency_.set_session_clock(clock); }
+
   // Crash recovery (§11.2): while the crashed journal's prefix replays into
   // this LIVE site, the deterministic components run in full — but nothing
   // may leave the building again: risk-passed orders were already sent by
   // the dead process, and journaled TimerEvts already carry the firings.
-  void set_recovering(bool r) noexcept { recovering_ = r; }
+  void set_recovering(bool r) noexcept {
+    recovering_ = r;
+    latency_.set_enabled(mode_ == Mode::Live && !r);
+    journal_.set_latency_enabled(mode_ == Mode::Live && !r);
+  }
   [[nodiscard]] bool recovering() const noexcept { return recovering_; }
 
   [[nodiscard]] PnlLedger& pnl() noexcept { return pnl_; }
@@ -129,6 +136,14 @@ class Site {
   [[nodiscard]] RiskGate& risk() noexcept { return risk_; }
   [[nodiscard]] ComplianceEngine& compliance() noexcept { return comp_; }
   [[nodiscard]] Telemetry& tel() noexcept { return tel_; }
+  // Explicit cold-path synchronization for status and end-of-session reports.
+  void refresh_latency() {
+    const auto snapshot = journal_.timing_snapshot();
+    latency_.replace(LatencyStage::JournalEnqueue, snapshot.enqueue);
+    latency_.replace(LatencyStage::JournalQueue, snapshot.queue);
+    latency_.replace(LatencyStage::JournalWriteBatch, snapshot.write_batch);
+    latency_.replace(LatencyStage::JournalFlush, snapshot.flush);
+  }
   [[nodiscard]] StreamCore& stream() noexcept { return stream_; }
   [[nodiscard]] const SiteConfig& config() const noexcept { return cfg_; }
   [[nodiscard]] const InstrumentTable& table() const noexcept { return *table_; }
@@ -152,8 +167,15 @@ class Site {
   // (venue feed, gateway reports, phase/timer ticks, operator commands).
   // Journaled as Source; replay re-injects them via inject().
   template <PlatMsg T>
-  HFT_FORCE_INLINE void source(const T& msg, Nanos ts) {
+  HFT_FORCE_INLINE void source(const T& msg, Nanos ts, Nanos received = 0) {
+    const auto begin = latency_.now();
+    if constexpr (std::is_same_v<T, MdSnapshotEvt> || std::is_same_v<T, MdOrderEvt> ||
+                  std::is_same_v<T, MdTradeEvt> || std::is_same_v<T, FeedGapEvt>)
+      latency_.record_queue(LatencyStage::MdQueue, received, begin);
+    else if constexpr (std::is_same_v<T, ExecReport> || std::is_same_v<T, SessionStateEvt>)
+      latency_.record_queue(LatencyStage::ResponseQueue, received, begin);
     dispatch(stream_.seal(ts, msg, Origin::Source));
+    latency_.record(LatencyStage::EngineEvent, begin, latency_.now());
   }
 
   // ----------------------------------------------------- session lifecycle
@@ -208,7 +230,7 @@ class Site {
     k.scope = scope;
     k.action = action;
     k.target = target;
-    dispatch(stream_.seal(k.ts, k, Origin::Source));
+    source(k, k.ts);
   }
 
   struct EodResult {
@@ -264,6 +286,8 @@ class Site {
 
   OrderId place(InstrumentId inst, Side side, Offset offset, Price px, Qty qty, Tif tif,
                 Nanos trigger_ts) {
+    const bool paused = strategy_timer_.pause(latency_.now());
+    const auto prepare_begin = latency_.now();
     NewOrderReq r{};
     r.cl_id = make_order_id(cfg_.epoch, ++next_order_seq_);
     r.ts = cur_ts_;
@@ -276,45 +300,63 @@ class Site {
     r.side = side;
     r.offset = offset;
     r.tif = tif;
-    dispatch(stream_.seal(cur_ts_, r, Origin::Derived));
+    const auto envelope = stream_.seal(cur_ts_, r, Origin::Derived);
+    dispatch(envelope, prepare_begin);
+    strategy_timer_.resume(latency_.now(), paused);
     return r.cl_id;
   }
 
   void cancel(OrderId id) {
+    const bool paused = strategy_timer_.pause(latency_.now());
+    const auto prepare_begin = latency_.now();
     const OmsOrder* o = oms_.find(id);
-    if (!o) return;
+    if (!o) {
+      strategy_timer_.resume(latency_.now(), paused);
+      return;
+    }
     CancelReq c{};
     c.cl_id = id;
     c.ts = cur_ts_;
     c.inst = o->inst;
     c.strategy = o->strategy;
     c.account = o->account;
-    dispatch(stream_.seal(cur_ts_, c, Origin::Derived));
+    const auto envelope = stream_.seal(cur_ts_, c, Origin::Derived);
+    latency_.record(LatencyStage::CancelPrepare, prepare_begin, latency_.now());
+    dispatch(envelope);
+    strategy_timer_.resume(latency_.now(), paused);
   }
 
   void set_timer(Nanos when, std::uint64_t token) {
     // Replay/recovery: TimerEvt firings come from the journal, not the heap.
     if (mode_ != Mode::Live || recovering_) return;
+    const bool paused = strategy_timer_.pause(latency_.now());
     if (timer_fn_) timer_fn_(timer_ctx_, when, token, dispatching_strategy_);
+    strategy_timer_.resume(latency_.now(), paused);
   }
 
   void send_intent(const HedgeIntent& h) {
+    const bool paused = strategy_timer_.pause(latency_.now());
     HedgeIntent out = h;
     out.origin_site = cfg_.id;
     out.ts = cur_ts_;
     dispatch(stream_.seal(cur_ts_, out, Origin::Derived));
+    strategy_timer_.resume(latency_.now(), paused);
   }
   void send_basis(const BasisSummary& b) {
+    const bool paused = strategy_timer_.pause(latency_.now());
     BasisSummary out = b;
     out.origin_site = cfg_.id;
     out.ts = cur_ts_;
     dispatch(stream_.seal(cur_ts_, out, Origin::Derived));
+    strategy_timer_.resume(latency_.now(), paused);
   }
   void send_hedge_done(const HedgeDone& d) {
+    const bool paused = strategy_timer_.pause(latency_.now());
     HedgeDone out = d;
     out.origin_site = cfg_.id;
     out.ts = cur_ts_;
     dispatch(stream_.seal(cur_ts_, out, Origin::Derived));
+    strategy_timer_.resume(latency_.now(), paused);
   }
 
   [[nodiscard]] Nanos now() const noexcept { return cur_ts_; }
@@ -339,8 +381,8 @@ class Site {
   void build_books();
   void wire_telemetry();
 
-  void dispatch(const Envelope& e);
-  HFT_FORCE_INLINE void on_new_order(const NewOrderReq& r);
+  void dispatch(const Envelope& e, Nanos order_prepare_begin = 0);
+  HFT_FORCE_INLINE void on_new_order(const NewOrderReq& r, Nanos prepare_begin);
   HFT_FORCE_INLINE void on_cancel_req(const CancelReq& c);
   HFT_FORCE_INLINE void on_exec_report(const Envelope& e);
   HFT_FORCE_INLINE void route(const Envelope& e);
@@ -416,8 +458,8 @@ class Site {
   std::uint64_t* c_risk_pass_ = nullptr;
   std::uint64_t* c_risk_deny_ = nullptr;
   std::uint64_t* c_deny_check_[static_cast<int>(kRiskCheckLast) + 1] = {};
-  LatencyHisto* h_t2t_ = nullptr;
-  LatencyHisto* h_rtt_ = nullptr;
+  LatencyMetrics latency_;
+  StrategyCalcTimer strategy_timer_;
   RiskDeny last_deny_{};
   OrderId last_manual_cl_id_ = kNoOrder;
   bool books_attached_ = false;

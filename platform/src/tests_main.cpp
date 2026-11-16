@@ -32,12 +32,8 @@ void test_kbar_snapshot();
 void test_indicators();
 // tests_engine.cpp
 void test_site_loop();
-void test_momentum_multi_instrument();
-void test_three_strategies();
-// tests_strats.cpp
-void test_two_momentum_instances();
-void test_strategy_config();
-void test_phase2_strategies_compile();
+void test_latency_measurements();
+void test_latency_boundaries();
 void test_crash_resume();
 void test_async_journal();
 // tests_ops.cpp
@@ -70,11 +66,8 @@ int main() {
   test_kbar_snapshot();
   test_indicators();
   test_site_loop();
-  test_momentum_multi_instrument();
-  test_three_strategies();
-  test_two_momentum_instances();
-  test_strategy_config();
-  test_phase2_strategies_compile();
+  test_latency_measurements();
+  test_latency_boundaries();
   test_crash_resume();
   test_async_journal();
   test_ops_param_update();

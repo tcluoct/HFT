@@ -2,8 +2,8 @@
 // toolkit: bucket alignment, snapshot volume differencing, midnight wrap,
 // ring history, and the integer indicator math.
 
-#include "plat/strat/indicators.hpp"
-#include "plat/strat/kbar.hpp"
+#include "plat/sdk/indicators.hpp"
+#include "plat/sdk/kbar.hpp"
 #include "tests_util.hpp"
 
 // ------------------------------------------------------------------ k-bars

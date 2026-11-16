@@ -75,7 +75,7 @@ Everything third-party that platd needs, with sources:
 
 | What | Version used | Where to download |
 |---|---|---|
-| **CTP client SDK** (`thosttraderapi_se`, `thostmduserapi_se`, 4 headers) | **v6.7.11** (verify with `platd --check`) | Official: SFIT 上期技术 <http://www.sfit.com.cn/5_2_DocumentDown.htm> (registration required) · SimNow mirror: <https://www.simnow.com.cn/static/apiDownload.action> · Pinned copy vendored in `platform/third_party/ctp/` (sourced from <https://github.com/vnpy/vnpy_ctp> `vnpy_ctp/api/`, which redistributes the official binaries — win64 DLL/lib + linux64 .so) |
+| **CTP client SDK** (`thosttraderapi_se`, `thostmduserapi_se`, 4 headers) | **v6.7.13 Windows x64** (verify with `platd --check`) | Official: SFIT 上期技术 <http://www.sfit.com.cn/5_2_DocumentDown.htm> (registration required) · SimNow mirror: <https://www.simnow.com.cn/static/apiDownload.action> · Pinned Windows x64 copy in `platform/third_party/ctp/`, installed from `v6.7.13_20260225_trader.zip`; archive checksum and layout: [SDK README](third_party/ctp/README.md) |
 | **Visual Studio 2022/2026 Build Tools** (MSVC v143+, C++ workload) — build machine only | MSVC 14.51 used here | <https://visualstudio.microsoft.com/downloads/> |
 | **CMake ≥ 3.21** — build machine only | 4.x (VS-bundled) | bundled with VS, or <https://cmake.org/download/> |
 | **VC++ Redistributable x64** — target server runtime | latest | <https://aka.ms/vs/17/release/vc_redist.x64.exe> |
@@ -308,7 +308,12 @@ Operating a fleet: the supervisor console routes commands — `2 halt` halts
 shard 2, `quit` stops all shards gracefully (as does Ctrl+C). Any terminal
 can command a shard directly: `echo halt > shard2.cmd`. Each shard writes
 `shardN.log`, its own journal, report, and EOD reconciliation (scoped to its
-own CTP session — other shards' orders and fills are not breaks).
+own CTP session — other shards' orders and fills are not breaks). Stopping
+the supervisor by force (the debugger's Stop button, Task Manager) does not
+take the shards with it — they keep running unsupervised and keep their
+journal files open, so a following fleet start would have two writers per
+journal. Stop a fleet with `quit` or Ctrl+C; if the supervisor is already
+gone, shut its shards down directly with `echo quit > shardN.cmd`.
 
 **Why each shard has its own md/td session** (not one shared feed process):
 shards subscribe to *disjoint* instrument sets, so nothing is transmitted or
@@ -457,13 +462,15 @@ platbt backtest.cfg day1.mdr day2.mdr ...           # or pass explicit files
 ```
 
 `platbt` replays recorded market data through the **exact same** engine and
-strategies platd runs live — `Site<..., SnapMomentum, MeanRevert, Breakout>`,
-the 20-check riskgate, the same books, the same PnL/fee library. Only the
-venue is modelled (an IOC fill-against-book simulator) instead of connected,
-so a backtest can never diverge from live behaviour: it *is* the same code,
-and the strategy config uses the identical keys — the same `strategies = ...`
-instance lists, per-instance params, and `risk.*`/`fees.*` blocks — copy them
-from your `platd.cfg` to test the exact lineup you deploy.
+strategies platd runs live — the house desk's `Site<..., SnapMomentum,
+MeanRevert, Breakout>` (composed in `desk/pack.hpp` from the `strategies/`
+team libraries, so both binaries link the identical lineup), the 20-check
+riskgate, the same books, the same PnL/fee library. Only the venue is modelled
+(an IOC fill-against-book simulator) instead of connected, so a backtest can
+never diverge from live behaviour: it *is* the same code, and the strategy
+config uses the identical keys — the same `strategies = ...` instance lists,
+per-instance params, and `risk.*`/`fees.*` blocks — copy them from your
+`platd.cfg` to test the exact lineup you deploy.
 
 **Selecting days by range.** Accumulate daily recordings in one directory
 (`bt.dir`, or `--dir`) and give a `--from`/`--to` window (yyyymmdd, inclusive;

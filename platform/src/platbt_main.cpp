@@ -30,19 +30,21 @@
 #include "plat/core/thread.hpp"
 #include "plat/core/time.hpp"
 #include "plat/ctp/conv.hpp"  // ctp::venue_from_exchange_id (typedefs only, no lib)
+#include "plat/engine/params.hpp"
 #include "plat/rec/backtest_gateway.hpp"
 #include "plat/rec/backtest_report.hpp"
 #include "plat/rec/tick_file.hpp"
-#include "strat_params.hpp"  // the shared strategy registry: Pack, PackSite, param maps
+#include "desk/pack.hpp"  // the deployed strategy lineup (composition root)
 
 using namespace plat;
 using namespace plat::rec;
 using namespace platcfg;
+using namespace desk;
 
 namespace {
 
 // The backtest runs the SAME strategy pack as platd's LiveSite (defined once
-// in strat_params.hpp) — only the gateway is a fill simulator, not a counter.
+// in desk/pack.hpp) — only the gateway is a fill simulator, not a counter.
 using BtSite = PackSite<BacktestGateway>;
 
 // Build the per-day instrument table from the .mdr directory. Reference data

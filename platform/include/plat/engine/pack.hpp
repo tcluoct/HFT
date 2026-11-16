@@ -1,9 +1,10 @@
 #pragma once
 // plat/engine/pack.hpp — the compile-time strategy registry: compose a Site
 // and its config-driven instance banks from a type list of strategy Defs, so
-// the platform's strategy lineup is declared in exactly ONE place (the Pack
-// alias in strat_params.hpp) and everything else — `type`-name parsing,
-// legacy defaults, bank building, Site instantiation — is derived from it.
+// a desk's strategy lineup is declared in exactly ONE place (the Pack alias
+// in the desk project, desk/pack.hpp) and everything else — `type`-name
+// parsing, legacy defaults, bank building, Site instantiation — is derived
+// from it.
 //
 // Each strategy header carries its own Def next to the class:
 //
@@ -67,14 +68,26 @@ inline std::vector<InstrumentId> universe_from(const Config& c, const Instrument
                                                const std::string& name) {
   const std::string key = name + ".instruments";
   const std::string used = c.has(key) ? key : std::string("instruments");
+  const std::vector<std::string> wanted = c.list(used);
   std::vector<InstrumentId> out;
-  for (const auto& n : c.list(used)) {
+  for (const auto& n : wanted) {
     const InstrumentId id = table.find(n);
     if (id == kNoInstrument)
       logf("[cfg] %s: `%s` is not hosted — skipped\n", used.c_str(), n.c_str());
     else
       out.push_back(id);
   }
+  // Say the RESULT out loud: a universe that resolved to nothing builds a
+  // strategy that can never signal, and without this line the only symptom is
+  // a healthy-looking session with zero orders (an example config left on
+  // expired contract symbols looks exactly like a broken engine).
+  if (out.empty() && !wanted.empty())
+    logf("[cfg] WARNING: `%s` universe is EMPTY (%s: %zu symbols, none hosted) — this "
+         "strategy cannot trade; check the symbols against the site's `instruments`\n",
+         name.c_str(), used.c_str(), wanted.size());
+  else if (!wanted.empty())
+    logf("[cfg] `%s` universe: %zu/%zu symbols hosted (%s)\n", name.c_str(), out.size(),
+         wanted.size(), used.c_str());
   return out;
 }
 

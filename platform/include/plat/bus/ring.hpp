@@ -36,7 +36,10 @@ class Ring {
 
   struct Slot {
     std::atomic<std::uint64_t> stamp{0};
-    std::uint8_t pad_[hft::kCacheLine - sizeof(std::atomic<std::uint64_t>)]{};
+    // Transport-only timestamp, protected by the same generation stamp.
+    // Uses existing padding; never copied into an Envelope or journal file.
+    std::atomic<Nanos> receive_ns{0};
+    std::uint8_t pad_[hft::kCacheLine - 2 * sizeof(std::atomic<std::uint64_t>)]{};
     std::atomic<std::uint64_t> word[kWords]{};
   };
   static_assert(sizeof(Slot) == hft::kCacheLine + sizeof(Envelope));
@@ -52,7 +55,7 @@ class Ring {
    public:
     explicit Writer(Ring& r) noexcept : r_(&r) {}
 
-    HFT_FORCE_INLINE std::uint64_t publish(const Envelope& e) noexcept {
+    HFT_FORCE_INLINE std::uint64_t publish(const Envelope& e, Nanos receive_ns = 0) noexcept {
       const std::uint64_t s = seq_++;
       Slot& sl = r_->slots_[s & r_->mask_];
       std::uint64_t w[kWords];
@@ -62,6 +65,7 @@ class Ring {
       std::atomic_thread_fence(std::memory_order_release);  // busy before payload
       for (std::size_t i = 0; i < kWords; ++i)
         sl.word[i].store(w[i], std::memory_order_relaxed);
+      sl.receive_ns.store(receive_ns, std::memory_order_relaxed);
       sl.stamp.store(2 * s + 2, std::memory_order_release);  // payload before done
       r_->pub_seq_.store(s + 1, std::memory_order_release);
       return s;
@@ -93,7 +97,7 @@ class Ring {
         : r_(&r), next_(from_origin ? 0 : r.pub_seq_.load(std::memory_order_acquire)),
           policy_(policy) {}
 
-    HFT_FORCE_INLINE Poll poll(Envelope& out) noexcept {
+    HFT_FORCE_INLINE Poll poll(Envelope& out, Nanos* receive_ns = nullptr) noexcept {
       if (faulted_) [[unlikely]] return {PollKind::Fault, 0};
       Slot& sl = r_->slots_[next_ & r_->mask_];
       const std::uint64_t done = 2 * next_ + 2;
@@ -103,9 +107,11 @@ class Ring {
         std::uint64_t w[kWords];
         for (std::size_t i = 0; i < kWords; ++i)
           w[i] = sl.word[i].load(std::memory_order_relaxed);
+        const auto received = sl.receive_ns.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);  // payload before re-check
         if (sl.stamp.load(std::memory_order_relaxed) == done) [[likely]] {
           std::memcpy(&out, w, sizeof(Envelope));
+          if (receive_ns) *receive_ns = received;
           ++next_;
           return {PollKind::Msg, 0};
         }

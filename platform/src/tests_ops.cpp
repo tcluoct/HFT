@@ -209,7 +209,7 @@ void test_ops_mirror() {
   plat::Config cfg;
   CHECK(cfg.load(cfg_path));
   std::vector<StratSpec> specs;
-  CHECK(platcfg::parse_strategies(cfg, AccountId{1}, specs));
+  CHECK(desk::parse_strategies(cfg, AccountId{1}, specs));
 
   std::uint64_t live_hash = 0;
   OrderId manual_id = kNoOrder;
@@ -225,9 +225,9 @@ void test_ops_mirror() {
     sc.journal_path = jnl_path;
     sc.limits = platcfg::limits_from(cfg);
     sc.fees = platcfg::fees_from(cfg);
-    using LiveTestSite = platcfg::PackSite<FakeGateway>;
+    using LiveTestSite = desk::PackSite<FakeGateway>;
     LiveTestSite site(table, sc, LiveTestSite::Mode::Live,
-                      platcfg::Pack::banks(cfg, table, specs));
+                      desk::Pack::banks(cfg, table, specs));
     FakeGateway gw;
     site.set_gateway(&gw);
 

@@ -9,8 +9,8 @@
 //   · strategy timer firings (TimerEvt) from the driver's timer heap;
 //   · operator kill-switch commands from the console.
 //
-// The site itself never reads a clock — now() is the timestamp of the
-// envelope being dispatched — so a day journaled here replays byte-identically
+// Business now() is the timestamp of the envelope being dispatched; separate
+// telemetry clocks do not affect replay. A day journaled here replays byte-identically
 // through the same Site in Replay mode (§11.1). That is the production
 // recovery drill: platd --replay <journal> <ref>.
 //
@@ -133,6 +133,7 @@ class LiveDriver {
         trade_reader_(trade_ring, /*from_origin=*/true, Ring::LossPolicy::Intolerant),
         schedule_(schedule), opt_(opt) {
     site.set_timer_sink(&LiveDriver::timer_thunk, this);
+    site.set_latency_clock(&live_now_ns);
   }
 
   // Strategy timers land on the driver's heap through the site's timer
@@ -224,17 +225,18 @@ class LiveDriver {
     bool any = false;
     for (int i = 0; i < 512; ++i) {  // bounded batch: order flow stays responsive
       Envelope e;
-      const auto p = md_reader_.poll(e);
+      Nanos received = 0;
+      const auto p = md_reader_.poll(e, &received);
       if (p.kind == Ring::PollKind::Empty || p.kind == Ring::PollKind::Fault) break;
       if (p.kind == Ring::PollKind::Gap) {
         logf("[drv] md ring lapped, lost %llu (books re-baseline)\n",
                      static_cast<unsigned long long>(p.gap));
         continue;
       }
-      if (e.is<MdSnapshotEvt>()) site_->source(e.as<MdSnapshotEvt>(), e.ts);
-      else if (e.is<MdOrderEvt>()) site_->source(e.as<MdOrderEvt>(), e.ts);
-      else if (e.is<MdTradeEvt>()) site_->source(e.as<MdTradeEvt>(), e.ts);
-      else if (e.is<FeedGapEvt>()) site_->source(e.as<FeedGapEvt>(), e.ts);
+      if (e.is<MdSnapshotEvt>()) site_->source(e.as<MdSnapshotEvt>(), e.ts, received);
+      else if (e.is<MdOrderEvt>()) site_->source(e.as<MdOrderEvt>(), e.ts, received);
+      else if (e.is<MdTradeEvt>()) site_->source(e.as<MdTradeEvt>(), e.ts, received);
+      else if (e.is<FeedGapEvt>()) site_->source(e.as<FeedGapEvt>(), e.ts, received);
       any = true;
     }
     return any;
@@ -244,7 +246,8 @@ class LiveDriver {
     bool any = false;
     for (;;) {
       Envelope e;
-      const auto p = trade_reader_.poll(e);
+      Nanos received = 0;
+      const auto p = trade_reader_.poll(e, &received);
       if (p.kind == Ring::PollKind::Empty) break;
       if (p.kind == Ring::PollKind::Fault) {
         // Exec-report loss: order state is no longer trustworthy (§7.1).
@@ -255,8 +258,8 @@ class LiveDriver {
         }
         break;
       }
-      if (e.is<ExecReport>()) site_->source(e.as<ExecReport>(), e.ts);
-      else if (e.is<SessionStateEvt>()) site_->source(e.as<SessionStateEvt>(), e.ts);
+      if (e.is<ExecReport>()) site_->source(e.as<ExecReport>(), e.ts, received);
+      else if (e.is<SessionStateEvt>()) site_->source(e.as<SessionStateEvt>(), e.ts, received);
       any = true;
     }
     return any;
@@ -355,6 +358,14 @@ class LiveDriver {
                    static_cast<unsigned long long>(tel.get("risk.pass")),
                    static_cast<unsigned long long>(tel.get("risk.deny")),
                    static_cast<int>(site_->session_state()));
+      site_->refresh_latency();
+      const auto timing_report = latency_report(tel);
+      // logf has a fixed per-line buffer: emit each metric separately.
+      for (std::size_t begin = 0, end; begin < timing_report.size(); begin = end + 1) {
+        end = timing_report.find('\n', begin);
+        if (end == std::string::npos) end = timing_report.size();
+        logf("%.*s\n", static_cast<int>(end - begin), timing_report.data() + begin);
+      }
       // Most recent risk denial, if any — printed here (cold, operator-
       // triggered) rather than at deny() time, which stays I/O-free (§14).
       if (const RiskDeny& d = site_->last_deny(); d.check != RiskCheck{}) {

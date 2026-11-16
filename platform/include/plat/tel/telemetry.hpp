@@ -7,6 +7,7 @@
 // the record path.
 
 #include <array>
+#include <chrono>
 #include <bit>
 #include <cstdint>
 #include <deque>
@@ -15,6 +16,12 @@
 
 namespace plat {
 
+// Performance clocks never feed strategy decisions or serialized state.
+using PerfClock = std::int64_t (*)();
+inline std::int64_t perf_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 class LatencyHisto {
  public:
   static constexpr int kLog2Buckets = 40;  // up to ~2^40 ns ≈ 18 min

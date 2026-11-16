@@ -154,7 +154,7 @@ class MdClient final : public CThostFtdcMdSpi {
     s.inst = sub->id;
     s.venue = sub->venue;
 
-    writer_.publish(make_envelope(0, s.ts, s, Origin::Source, 0));
+    writer_.publish(make_envelope(0, s.ts, s, Origin::Source, 0), s.ts);
     snapshots_.fetch_add(1, std::memory_order_relaxed);
   }
 

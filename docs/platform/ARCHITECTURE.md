@@ -620,6 +620,18 @@ feed gaps. Per-feed gap-recovery conformance evidence is a Phase-1 exit gate (§
 - **Determinism contract**: no syscalls, no allocation, no clocks other than injected
   event time, no global state outside the framework — enforcing that a strategy is a
   pure function of its event stream (this is what makes backtest = live).
+- **Implemented as a compile-time container, one static library per team**:
+  the platform ships the strategy SDK (`plat/sdk/`: the CRTP `Strategy<D>`
+  contract, signal/bar primitives, the shared position-cycle FSM) plus the
+  market-data/reference/accounting types (`strat_sdk`); each strategy team
+  owns a static-library project under `strategies/<team>/` that links that
+  SDK and never the engine. A *desk* project (`desk/pack.hpp`) appends the
+  fielded teams' `Def`s to one `StratPack`, from which parsing, bank building
+  and the `Site` composition are derived. The handler call is a direct,
+  inlinable template call — no vtable on the tick path — and the platform
+  binaries link a desk, so changing the deployed lineup never edits the
+  engine. This realises the inline mode below; the pod mode remains the
+  design position for isolating heavier/experimental strategies.
 - Two deployment modes per strategy, chosen by config:
   - **inline** — compiled into the bookeng/strategy process, called synchronously on
     book update (hottest path, ~zero hop cost);

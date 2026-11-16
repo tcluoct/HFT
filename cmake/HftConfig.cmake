@@ -46,3 +46,19 @@ function(hft_configure tgt)
     set_property(TARGET ${tgt} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
   endif()
 endfunction()
+
+# Configure a STATIC library that OWNS header-only code (plat_core, strat_sdk,
+# platform_lib and every strategy-team / desk library). The headers themselves
+# are compiled at their use sites with that consumer's hft_configure() flags;
+# this only builds the anchor TU with the family language/encoding contract and
+# keeps Release LTCG consistent between the anchors and the executables.
+function(hft_configure_lib tgt)
+  target_link_libraries(${tgt} PRIVATE hft::common)
+  set_target_properties(${tgt} PROPERTIES FOLDER ${PROJECT_NAME})
+  if(MSVC)
+    target_compile_options(${tgt} PRIVATE /utf-8 /EHsc)
+  endif()
+  if(HFT_IPO_OK)
+    set_property(TARGET ${tgt} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+  endif()
+endfunction()

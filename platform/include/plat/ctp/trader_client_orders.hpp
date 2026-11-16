@@ -407,7 +407,7 @@ inline void TraderClient::cancel_reject_by_ref(const char* order_ref) {
 
 inline void TraderClient::publish_report(const ExecReport& r) {
   std::lock_guard lk(ring_mtx_);
-  writer_.publish(make_envelope(0, r.ts, r, Origin::Source, 0));
+  writer_.publish(make_envelope(0, r.ts, r, Origin::Source, 0), r.ts);
 }
 
 inline void TraderClient::set_state(SessState s) {
@@ -422,7 +422,7 @@ inline void TraderClient::set_state(SessState s) {
   e.venue = Venue::SHFE;  // session is per-counter, not per-venue; tag is cosmetic
   e.state = s;
   std::lock_guard lk(ring_mtx_);
-  writer_.publish(make_envelope(0, e.ts, e, Origin::Source, 0));
+  writer_.publish(make_envelope(0, e.ts, e, Origin::Source, 0), e.ts);
 }
 
 }  // namespace plat::ctp

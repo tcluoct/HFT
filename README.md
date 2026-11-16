@@ -7,6 +7,12 @@ low-latency techniques so the family doubles as a technique catalog. Every
 README reports real numbers measured on this machine, and every core is
 proven by framework-less scenario tests.
 
+`platform/` is the production system those labs graduate into. Its strategy
+lineup is not part of the engine: strategy teams own separate static-library
+projects under `strategies/`, and a `desk` project composes the teams into
+the lineup the platform binaries link. See
+[strategies/README.md](strategies/README.md) and [desk/README.md](desk/README.md).
+
 ```
                         ┌───────────────────────────────────────────────────┐
  venue side             │                firm side                          │
@@ -41,6 +47,30 @@ proven by framework-less scenario tests.
 | [sord](sord/) | Routing: smart order router | Compile-time Batcher sorting networks, packed u64 rank keys, all-in venue cost model, largest-remainder splits, naive-vs-model quality duel |
 | [quotd](quotd/) | Market making: two-sided quote engine | Desired-vs-working diff engine, queue-priority hysteresis band, inventory skew LUT, O(1) epoch mass-pull, adverse-selection fill sim |
 
+## Production composition: platform, strategy teams, desk
+
+The platform is one execution system many strategy teams trade on, and the
+build graph says so:
+
+```
+plat_core → strat_sdk → strategies/<team>          one static_lib per team
+                ↑                      ↓
+         platform_lib (engine)  →   desk   →  platd / platbt / platops / …
+```
+
+| Project | Role |
+|---|---|
+| [platform](platform/) | Engine + strategy SDK. Ships `plat/sdk/` (the CRTP contract and primitives) and the trading stack; ships **no concrete strategy**. |
+| [strategies/trend](strategies/trend/) | `strat_trend` — snapshot momentum + session breakout. |
+| [strategies/fade](strategies/fade/) | `strat_fade` — snapshot mean-reversion. |
+| [strategies/basis](strategies/basis/) | `strat_basis` — futures–spot arbitrage legs (Phase 2). |
+| [strategies/cash](strategies/cash/) | `strat_cash` — T+0 alpha on carried stock inventory (Phase 2). |
+| [desk](desk/) | The composition root: appends the fielded teams' `Def`s to a `StratPack` and exports the `Pack`/`PackSite` the platform apps link. |
+
+A team library links only `strat_sdk` and never the engine; the platform
+engine never includes a strategy header. A new strategy type is a team-local
+header plus one append-only line in `desk/pack.hpp` — no platform change.
+
 ## Building
 
 The whole solution (every project + one `hft.sln` for Visual Studio):
@@ -50,10 +80,37 @@ cmake --preset vs2026                    # or vs2022; or open the folder in VS
 cmake --build --preset vs2026-release
 build\vs2026\<project>\Release\<project>.exe          # bench harness
 build\vs2026\<project>\Release\<project>_tests.exe    # scenario tests
+build\vs2026\strategies\<team>\Release\strat_<team>_tests.exe   # team suite
+build\vs2026\desk\Release\desk_tests.exe              # desk/lineup suite
 ```
 
 Each project also configures standalone — run the same two commands inside
 its directory; it pulls in `common/` and the shared build config itself.
+
+On Windows with Visual Studio 2026, `build-vs.cmd` locates the installed IDE
+and bundled CMake, configures the solution, and builds Release x64.
+Use `open-vs.cmd` to open the generated solution with the same environment.
+The startup project is `platd`: F5 runs it
+with `--fleet <repo>\platform\platd.fleet.example.cfg`, working from its
+output directory, where the CTP DLLs and the runtime journals/logs live. The
+config is read from the source tree, so editing
+`platform/platd.fleet.example.cfg` in the IDE takes effect on the very next
+F5, and a copy of both example configs is refreshed beside the exe on every
+build for runs started outside the IDE. This starts the configured CTP
+sessions; an expired contract symbol in the fleet config aborts a shard at
+startup (the counter answers "not found", leaving no instrument to trade),
+and `platd_fleet.log`, `shardN.log` and `shardN.jnl.log` in the output
+directory record why. Use `--check platd.example.cfg` in the project's
+Debugging arguments for an offline configuration/SDK check instead.
+Both launchers restore missing standard Windows folder variables locally;
+they do not change registry or machine settings.
+
+If MSBuild reports `MSB4018` in `FileTracker.InitializeCommonApplicationDataPaths`
+with an invalid-path exception, its parent process may have omitted
+`ProgramData` or `SystemDrive`, leaving the registered `%ProgramData%` path
+unexpanded. Save your work, close the existing HFT Visual Studio window,
+and reopen using `open-vs.cmd`. An already running IDE retains its old
+environment. Do not disable compiler dependency tracking to work around this.
 
 ## Shared pieces
 

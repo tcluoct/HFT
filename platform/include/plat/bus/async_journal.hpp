@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -30,6 +31,7 @@
 #include "plat/bus/journal.hpp"
 #include "plat/bus/ring.hpp"
 #include "plat/core/thread.hpp"
+#include "plat/tel/telemetry.hpp"
 
 namespace plat {
 
@@ -53,7 +55,23 @@ class AsyncJournal {
   }
 
   // Engine thread, hot path: one wait-free 256-byte publish, no syscalls.
-  HFT_FORCE_INLINE void append(const Envelope& e) noexcept { writer_->publish(e); }
+  HFT_FORCE_INLINE void append(const Envelope& e) noexcept {
+    const auto begin = latency_enabled_ ? perf_now_ns() : 0;
+    writer_->publish(e, begin);
+    if (latency_enabled_) enqueue_.record(perf_now_ns() - begin);
+  }
+
+  // Called by the producer only; worker uses each record's metadata instead.
+  void set_latency_enabled(bool enabled) { latency_enabled_ = enabled; }
+  struct TimingSnapshot { LatencyHisto enqueue, queue, write_batch, flush; };
+  // Cold path, called by the engine/report owner. Worker publishes copies;
+  // it never writes the engine's Telemetry object.
+  TimingSnapshot timing_snapshot() {
+    std::lock_guard lock(timing_mutex_);
+    auto result = published_timing_;
+    result.enqueue = enqueue_;
+    return result;
+  }
 
   // False once the writer thread was lapped (audit hole) — fail closed.
   [[nodiscard]] bool healthy() const noexcept {
@@ -66,6 +84,10 @@ class AsyncJournal {
     if (thread_.joinable()) {
       stop_.store(true, std::memory_order_release);
       thread_.join();
+      {
+        std::lock_guard lock(timing_mutex_);
+        published_timing_ = worker_timing_; // final snapshot after join
+      }
       jw_.close();  // seals (count + running hash) and closes
     }
     open_ = false;
@@ -80,13 +102,22 @@ class AsyncJournal {
     Ring::Reader reader(*ring_, /*from_origin=*/true, Ring::LossPolicy::Intolerant);
     Envelope e;
     bool dirty = false;  // appended since the last flush
+    Nanos batch_begin = 0, batch_end = 0;
+    std::uint64_t messages = 0;
     for (;;) {
-      const auto p = reader.poll(e);
+      Nanos enqueued = 0;
+      const auto p = reader.poll(e, &enqueued);
       switch (p.kind) {
-        case Ring::PollKind::Msg:
+        case Ring::PollKind::Msg: {
+          const auto begin = enqueued ? perf_now_ns() : 0;
+          if (enqueued && begin >= enqueued) worker_timing_.queue.record(begin - enqueued);
+          if (enqueued && !batch_begin) batch_begin = begin;
           jw_.append(e);
+          if (enqueued) batch_end = perf_now_ns();
           dirty = true;
-          continue;  // drain the batch before sleeping
+          if (++messages % 256 == 0) publish_timing();
+          continue;
+        }  // drain the batch before sleeping
         case Ring::PollKind::Fault:
           fault_.store(true, std::memory_order_release);
           return;  // the record is already broken; stop appending
@@ -98,7 +129,14 @@ class AsyncJournal {
         // Crash durability: hand the burst to the OS before sleeping — a
         // process crash then loses nothing that was ever appended (§11.2,
         // what --resume replays). Costs a syscall per burst, on this thread.
+        const auto flush_begin = batch_begin ? perf_now_ns() : 0;
         jw_.flush();
+        if (batch_begin) {
+          worker_timing_.write_batch.record(batch_end - batch_begin);
+          worker_timing_.flush.record(perf_now_ns() - flush_begin);
+          batch_begin = 0;
+        }
+        publish_timing();
         dirty = false;
       }
       if (stop_.load(std::memory_order_acquire)) return;  // drained + stopping
@@ -106,6 +144,18 @@ class AsyncJournal {
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
   }
+
+  void publish_timing() {
+    // A report must never stall the journal worker.
+    std::unique_lock lock(timing_mutex_, std::try_to_lock);
+    if (lock.owns_lock()) published_timing_ = worker_timing_;
+  }
+
+  LatencyHisto enqueue_; // producer only
+  TimingSnapshot worker_timing_; // worker only until joined
+  TimingSnapshot published_timing_; // guarded by timing_mutex_
+  std::mutex timing_mutex_;
+  bool latency_enabled_ = true; // producer only
 
   // 64 Ki slots × 320 B ≈ 20 MiB ≈ many minutes of futures snapshots, or
   // ~0.6 s of a full 逐笔 stock feed — the disk must stall that long before

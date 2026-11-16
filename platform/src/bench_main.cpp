@@ -15,7 +15,7 @@
 #include "plat/bus/ring.hpp"
 #include "plat/core/time.hpp"
 #include "plat/engine/site.hpp"
-#include "plat/strat/momentum.hpp"
+#include "strat/trend/momentum.hpp"
 
 using namespace plat;
 

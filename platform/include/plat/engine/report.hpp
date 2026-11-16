@@ -2,8 +2,8 @@
 // plat/engine/report.hpp — the end-of-session report (§11.3, §14): one text
 // artifact per site per day covering pre-flight, activity, risk denials by
 // check, compliance counters vs the HFT thresholds, latency percentiles, and
-// reconciliation results. Everything here is derived from stream-fed state,
-// so the same report can be regenerated from the journal.
+// reconciliation results. Business state is reproducible from the journal;
+// elapsed-time histograms are live telemetry and cannot be replayed.
 
 #include <format>
 #include <string>
@@ -47,11 +47,8 @@ std::string session_report(SiteT& site) {
                      al.what);
   }
 
-  for (const auto& [name, h] : tel.histos()) {
-    if (h.count() == 0) continue;
-    r += std::format("{}: n={} p50={} p99={} p99.9={} max={} (ns)\n", name, h.count(),
-                     h.percentile(0.50), h.percentile(0.99), h.percentile(0.999), h.max());
-  }
+  site.refresh_latency();
+  r += latency_report(tel);
 
   const auto& eod = site.eod();
   if (eod.ran) {

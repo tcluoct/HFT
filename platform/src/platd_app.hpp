@@ -17,31 +17,33 @@
 #include "plat/core/phase.hpp"
 #include "plat/core/types.hpp"
 #include "plat/ctp/trader_client.hpp"
+#include "plat/engine/params.hpp"
 #include "plat/engine/site.hpp"
 #include "plat/ref/instrument.hpp"
 #include "plat/ref/positions_file.hpp"
+#include "desk/pack.hpp"     // the deployed strategy lineup (composition root)
 #include "fleet_cfg.hpp"     // shardN.* overlay machinery (also used by platops)
-#include "strat_params.hpp"  // shared strategy registry + Config→params mapping (also used by platbt)
 
 namespace platd {
 
-// Shared strategy registry (Pack) and risk/fee param mapping (limits_from,
-// fees_from) — the same definitions the backtester uses, so live and
-// backtest can never diverge. Pulled into this namespace so platd code calls
-// them unqualified.
+// The desk's strategy lineup (Pack) and the platform risk/fee param mapping
+// (limits_from, fees_from) — the same definitions the backtester and ops
+// mirror use, so live/backtest/mirror can never diverge. The platform engine
+// itself ships no strategies: this daemon is one composition of one desk.
 using namespace platcfg;
+using namespace desk;
 
-// The composition this daemon ships (§9.1 inline mode): the shared strategy
-// type pack (strat_params.hpp) over the CTP counter gateway. Which instances
+// The composition this daemon ships (§9.1 inline mode): the desk's strategy
+// type pack (desk/pack.hpp) over the CTP counter gateway. Which instances
 // of those types actually run — how many, with what ids/params/universes —
-// is config (`strategies = ...`), parsed by platcfg::parse_strategies so
-// live and backtest are built from the identical definitions. (StratPack
-// itself asserts every pack member is CRTP — no vtable on the hot path.)
+// is config (`strategies = ...`), parsed by desk::parse_strategies so live
+// and backtest are built from the identical definitions. (StratPack itself
+// asserts every pack member is CRTP — no vtable on the hot path.)
 using LiveSite = PackSite<plat::ctp::TraderClient>;
 
 // ---- platd-specific config (platd_config.cpp; the shared params come from
-// strat_params.hpp / platcfg above; shard_config / fleet_shard_ids from
-// fleet_cfg.hpp, shared with platops)
+// plat/engine/params.hpp + desk/pack.hpp above; shard_config /
+// fleet_shard_ids from fleet_cfg.hpp, shared with platops)
 plat::PhaseSchedule schedule_from(const plat::Config& c);
 bool require_keys(const plat::Config& c);
 void write_cmd_file(int shard, const std::string& cmd);

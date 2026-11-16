@@ -11,7 +11,7 @@
 #include "plat/rec/backtest_gateway.hpp"
 #include "plat/rec/tick_file.hpp"
 #include "plat/rec/tick_merge.hpp"
-#include "plat/strat/momentum.hpp"
+#include "strat/trend/momentum.hpp"
 #include "tests_util.hpp"
 
 // ---------------------------------------------- market-data recorder codec

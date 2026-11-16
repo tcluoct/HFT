@@ -7,15 +7,15 @@
 
 #include "plat/core/log.hpp"
 #include "platd_app.hpp"
-#include "strat_params.hpp"
 
 using namespace plat;
 
 namespace platd {
 
-// The strategy/risk/fee param mapping lives in strat_params.hpp, shared with
-// platbt so live and backtest build the identical strategies (§9); this file
-// keeps only the platd-specific config (schedule, fleet sections).
+// Risk/fee config mapping lives in plat/engine/params.hpp (owned by the
+// platform), the strategy lineup in desk/pack.hpp (owned by the desk both
+// platd and platbt link) — neither is duplicated here. This file keeps only
+// the platd-specific config (schedule, fleet sections).
 
 // "HH:MM Phase, HH:MM Phase, ..." — falls back to the standard futures day
 // session. Night sessions crossing midnight use 24h+ times (01:00 → 25:00).

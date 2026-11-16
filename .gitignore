@@ -3,6 +3,8 @@ build/
 **/build/
 out/
 bin/
+!platform/third_party/ctp/bin/
+!platform/third_party/ctp/bin/*.dll
 
 # Crash dumps
 *.dmp
