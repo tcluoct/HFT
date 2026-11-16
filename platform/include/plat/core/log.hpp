@@ -19,6 +19,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <string>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -34,8 +36,21 @@ inline std::FILE*& log_file_slot() {
 
 // Tee every subsequent logf line into `path` (append + unbuffered). Call
 // once at startup, before anything that can fail; returns false if the file
-// cannot be opened (logging then continues on stderr alone).
+// cannot be opened (logging then continues on stderr alone). A log larger
+// than 64 MiB is rotated once to `<path>.1` at session start, so a long-lived
+// deployment cannot fill the journal volume with console text while keeping
+// the previous run's crash evidence.
 inline bool log_open_file(const char* path) {
+  std::error_code ec;
+  constexpr std::uintmax_t kRotateBytes = 64ull << 20;
+  if (std::filesystem::exists(path, ec)) {
+    const auto size = std::filesystem::file_size(path, ec);
+    if (!ec && size >= kRotateBytes) {
+      const std::string rotated = std::string(path) + ".1";
+      std::filesystem::remove(rotated, ec);
+      std::filesystem::rename(path, rotated, ec);
+    }
+  }
   std::FILE* f = std::fopen(path, "ab");
   if (!f) return false;
   std::setvbuf(f, nullptr, _IONBF, 0);

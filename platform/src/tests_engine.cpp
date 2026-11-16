@@ -9,6 +9,8 @@
 #include <string>
 
 #include "plat/bus/journal.hpp"
+#include "plat/engine/fingerprint.hpp"
+#include "plat/engine/snapshot.hpp"
 #include "plat/replay/replayer.hpp"  // compile coverage: recovery tooling API
 #include "tests_util.hpp"
 
@@ -223,6 +225,404 @@ void test_crash_resume() {
   std::remove(resumed_path);
 }
 
+// ------------------------------------------------ FLATTEN close-out (§10.3)
+
+// HALT refuses everything and never sends a close. FLATTEN is reduce-only:
+// it cancels resting orders, closes every position bucket with IOC orders
+// (split to the firm's max order size), keeps opening orders blocked, and
+// becomes flat once the closes fill.
+void test_flatten_closeout() {
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.id = 1;
+  sc.name = "flat";
+  sc.venue = Venue::SHFE;
+  sc.hosted = {0};
+  sc.day = 20'260'713;
+  RiskLimits wide;
+  wide.max_order_qty = 20;  // 25-lot long must split into 20 + 5
+  wide.max_actions_per_sec = 1'000;
+  wide.max_actions_per_day = 10'000;
+  wide.max_order_notional_e4 = px_from_cny(1e9);
+  wide.max_net_notional_e4 = px_from_cny(1e9);
+  wide.max_margin_e4 = px_from_cny(1e9);
+  wide.duplicate_horizon = 0;
+  wide.price_collar_ticks = 1'000;
+  sc.limits = wide;
+
+  MomentumParams mp;
+  mp.imb_gate_e4 = 9'000'000;  // stay quiet: this test drives kill commands only
+  TestSite site(table, sc, TestSite::Mode::Live,
+                {SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0})});
+  FakeGateway gw;
+  site.set_gateway(&gw);
+
+  PhaseChangeEvt ph{};
+  ph.ts = at_time(9, 0);
+  ph.venue = Venue::SHFE;
+  ph.phase = Phase::Continuous;
+  site.source(ph, ph.ts);
+  site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
+
+  // Two books, three close buckets: long-yesterday (splits), short-today.
+  site.pnl().at(1, 1, 0).long_yd = 25;
+  site.pnl().at(1, 2, 0).short_td = 3;
+
+  // HALT is not flatten: nothing is sent, the positions stay.
+  site.command_kill(KillScope::Site, KillAction::Halt, 0, at_time(9, 0, 2));
+  CHECK(gw.placed.empty());
+  CHECK(site.pnl().find(1, 1, 0)->long_yd == 25);
+
+  // FLATTEN closes both books: 25 long-yesterday -> sell 20 + 5 close-yesterday
+  // at the bid; 3 short-today -> buy 3 close-today at the ask.
+  site.command_kill(KillScope::Site, KillAction::Disarm, 0, at_time(9, 0, 3));
+  site.command_kill(KillScope::Site, KillAction::Flatten, 0, at_time(9, 0, 4));
+  CHECK(gw.placed.size() == 3);
+  CHECK(gw.placed[0].side == Side::Sell && gw.placed[0].offset == Offset::CloseYesterday &&
+        gw.placed[0].qty == 20 && gw.placed[0].px == px_from_cny(78'000.0));
+  CHECK(gw.placed[1].side == Side::Sell && gw.placed[1].offset == Offset::CloseYesterday &&
+        gw.placed[1].qty == 5);
+  CHECK(gw.placed[2].side == Side::Buy && gw.placed[2].offset == Offset::CloseToday &&
+        gw.placed[2].qty == 3 && gw.placed[2].px == px_from_cny(78'010.0));
+
+  // Opening stays refused while FLATTEN is armed.
+  const OrderId blocked =
+      site.place(0, Side::Buy, Offset::Open, px_from_cny(78'010.0), 1, Tif::Ioc,
+                 at_time(9, 0, 5));
+  CHECK(gw.placed.size() == 3);
+  CHECK(site.last_deny().cl_id == blocked && site.last_deny().check == RiskCheck::KillSwitch);
+
+  // Fill the closes: both books go flat.
+  for (const NewOrderReq& r : gw.placed) {
+    ExecReport fill{};
+    fill.cl_id = r.cl_id;
+    fill.ts = at_time(9, 0, 6);
+    fill.px = r.px;
+    fill.qty = r.qty;
+    fill.cum = r.qty;
+    fill.inst = r.inst;
+    fill.strategy = r.strategy;
+    fill.account = r.account;
+    fill.type = ExecType::Fill;
+    fill.side = r.side;
+    fill.offset = r.offset;
+    site.source(fill, fill.ts);
+  }
+  CHECK(site.pnl().find(1, 1, 0)->net() == 0);
+  CHECK(site.pnl().find(1, 2, 0)->net() == 0);
+  CHECK(site.state_hash() != 0);
+
+  // Disarm lifts the reduce-only mode (the operator takes the book back).
+  site.command_kill(KillScope::Site, KillAction::Disarm, 0, at_time(9, 0, 7));
+  CHECK(!site.risk().kill().any_armed());
+}
+
+// FLATTEN must be deterministic like every other engine action: the close
+// orders it generates are Derived envelopes, so replaying only the journal's
+// Source prefix must regenerate the exact same canonical stream.
+void test_flatten_replay() {
+  const char* path = "plat_flatten_replay.jnl";
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.id = 1;
+  sc.name = "flat-replay";
+  sc.venue = Venue::SHFE;
+  sc.hosted = {0};
+  sc.day = 20'260'713;
+  sc.journal_path = path;
+  RiskLimits wide;
+  wide.max_order_qty = 20;
+  wide.max_actions_per_sec = 1'000;
+  wide.max_actions_per_day = 10'000;
+  wide.max_order_notional_e4 = px_from_cny(1e9);
+  wide.max_net_notional_e4 = px_from_cny(1e9);
+  wide.max_margin_e4 = px_from_cny(1e9);
+  wide.duplicate_horizon = 0;
+  wide.price_collar_ticks = 1'000;
+  sc.limits = wide;
+
+  MomentumParams mp;
+  mp.imb_gate_e4 = 9'000'000;
+  const auto banks = [&] {
+    return std::vector<SnapMomentum>{
+        SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0})};
+  };
+  {
+    TestSite site(table, sc, TestSite::Mode::Live, banks());
+    FakeGateway gw;
+    site.set_gateway(&gw);
+    PhaseChangeEvt ph{};
+    ph.ts = at_time(9, 0);
+    ph.venue = Venue::SHFE;
+    ph.phase = Phase::Continuous;
+    site.source(ph, ph.ts);
+    site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
+    // Seed the position through the JOURNALED fill path (a direct PnL poke
+    // would not exist in replay, so the replay would legitimately flatten
+    // nothing and the hash comparison would be meaningless).
+    ExecReport fill{};
+    fill.cl_id = 0x1234;
+    fill.ts = at_time(9, 0, 1, 500 * kNsPerMs);
+    fill.px = px_from_cny(78'000.0);
+    fill.qty = 7;
+    fill.cum = 7;
+    fill.leaves = 0;
+    fill.inst = 0;
+    fill.strategy = 1;
+    fill.account = 1;
+    fill.type = ExecType::Fill;
+    fill.side = Side::Buy;
+    fill.offset = Offset::Open;
+    site.source(fill, fill.ts);
+    CHECK(site.pnl().find(1, 1, 0)->long_td == 7);  // a fill today opens today's bucket
+    site.command_kill(KillScope::Site, KillAction::Flatten, 0, at_time(9, 0, 2));
+    CHECK(gw.placed.size() == 1);  // 7 lots <= max_order_qty: one close
+    site.run_eod({}, 0, 0);
+  }
+  JournalReader jr;
+  CHECK(jr.open(path));
+  CHECK(jr.sealed() && jr.verified());
+
+  TestSite replay(table, sc, TestSite::Mode::Replay, banks());
+  FakeGateway gw;
+  replay.set_gateway(&gw);
+  for (const Envelope& e : jr.envelopes()) replay.inject(e);
+  CHECK(gw.placed.empty());  // Replay mode never sends
+  CHECK(replay.stream().stream_hash() == jr.header().stream_hash);
+  std::remove(path);
+}
+
+// Session identity: the `.session` sidecar must round-trip and every input
+// that changes behavior must change the config hash (otherwise a resume guard
+// would pass while replaying against a different composition).
+void test_session_fingerprint() {
+  const char* path = "plat_session_fp.bin";
+  SessionFingerprint a;
+  a.build = 0x1111;
+  a.pack = 0x2222;
+  a.config = 0x3333;
+  a.day = 20'260'713;
+  a.site = 1;
+  CHECK(save_session_fingerprint(path, a));
+  SessionFingerprint b;
+  CHECK(load_session_fingerprint(path, b));
+  CHECK(same_fingerprint(a, b));
+  b.config ^= 1;
+  CHECK(!same_fingerprint(a, b));
+  std::remove(path);
+  CHECK(build_fingerprint() != 0);
+
+  InstrumentTable t = one_future();
+  FeeSchedule f;
+  std::vector<StratSpec> specs;
+  const auto c1 = config_fingerprint(specs, f, t, {0}, 250);
+  f.fut_per_lot_e4 += 1;
+  const auto c2 = config_fingerprint(specs, f, t, {0}, 250);
+  CHECK(c1 != c2);  // fee schedule is part of the behavior identity
+  CHECK(config_fingerprint(specs, f, t, {0}, 251) != c2);  // rate cap is structural
+}
+
+// Live risk-limit reload is a journaled Source event, applied on the engine
+// thread: an order that was too large before the update passes after it, and
+// a rate-ring resize (restart-only) is rejected rather than silently ignored.
+void test_risk_limits_reload() {
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.id = 1;
+  sc.name = "limits";
+  sc.venue = Venue::SHFE;
+  sc.hosted = {0};
+  sc.day = 20'260'713;
+  RiskLimits l;
+  l.max_order_qty = 1;
+  l.max_actions_per_sec = 1'000;
+  l.max_actions_per_day = 10'000;
+  l.max_order_notional_e4 = px_from_cny(1e9);
+  l.max_net_notional_e4 = px_from_cny(1e9);
+  l.max_margin_e4 = px_from_cny(1e9);
+  l.duplicate_horizon = 0;
+  l.price_collar_ticks = 1'000;
+  sc.limits = l;
+
+  MomentumParams mp;
+  mp.imb_gate_e4 = 9'000'000;
+  TestSite site(table, sc, TestSite::Mode::Live,
+                {SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0})});
+  FakeGateway gw;
+  site.set_gateway(&gw);
+  PhaseChangeEvt ph{};
+  ph.ts = at_time(9, 0);
+  ph.venue = Venue::SHFE;
+  ph.phase = Phase::Continuous;
+  site.source(ph, ph.ts);
+  site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
+
+  const OrderId too_big =
+      site.place(0, Side::Buy, Offset::Open, px_from_cny(78'010.0), 2, Tif::Ioc,
+                 at_time(9, 0, 2));
+  CHECK(gw.placed.empty());
+  CHECK(site.last_deny().cl_id == too_big && site.last_deny().check == RiskCheck::SizeNotional);
+
+  RiskLimits next = site.risk().limits();
+  next.max_order_qty = 5;
+  RiskLimitsEvt ev{};
+  ev.ts = at_time(9, 0, 3);
+  ev.version = 1;
+  ev.limits = next;
+  site.source(ev, ev.ts);
+  CHECK(site.risk().limits().max_order_qty == 5);
+
+  site.place(0, Side::Buy, Offset::Open, px_from_cny(78'010.0), 2, Tif::Ioc,
+             at_time(9, 0, 4));
+  CHECK(gw.placed.size() == 1 && gw.placed[0].qty == 2);
+
+  // Changing the rate-ring size is restart-only: the gate keeps the old value.
+  RiskLimits bad = site.risk().limits();
+  bad.max_actions_per_sec += 1;
+  RiskLimitsEvt bad_ev{};
+  bad_ev.ts = at_time(9, 0, 5);
+  bad_ev.version = 2;
+  bad_ev.limits = bad;
+  site.source(bad_ev, bad_ev.ts);
+  CHECK(site.risk().limits().max_actions_per_sec == 1'000);
+}
+
+// Checkpoint recovery: a snapshot at envelope K plus the journal suffix must
+// reconstruct the identical state and canonical stream. The prefix is copied
+// into the new stream without dispatch (fast), the snapshot supplies state,
+// and only the Source suffix is dispatched.
+void test_snapshot_resume() {
+  const char* jnl = "plat_snapshot_test.jnl";
+  const char* snap_file = "plat_snapshot_test.jnl.snap";
+  const char* sess = "plat_snapshot_test.jnl.session";
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.id = 1;
+  sc.name = "snap";
+  sc.venue = Venue::SHFE;
+  sc.hosted = {0};
+  sc.day = 20'260'713;
+  sc.journal_path = jnl;
+  RiskLimits wide;
+  wide.max_order_qty = 20;
+  wide.max_actions_per_sec = 1'000;
+  wide.max_actions_per_day = 10'000;
+  wide.max_order_notional_e4 = px_from_cny(1e9);
+  wide.max_net_notional_e4 = px_from_cny(1e9);
+  wide.max_margin_e4 = px_from_cny(1e9);
+  wide.duplicate_horizon = 0;
+  wide.price_collar_ticks = 1'000;
+  sc.limits = wide;
+  MomentumParams mp;
+  mp.imb_gate_e4 = 9'000'000;
+  const auto banks = [&] {
+    return std::vector<SnapMomentum>{
+        SnapMomentum(StrategyId{1}, AccountId{1}, mp, table.size(), {0})};
+  };
+  SessionFingerprint fp;
+  fp.build = 1;
+  fp.pack = 2;
+  fp.config = 3;
+  fp.day = sc.day;
+  fp.site = sc.id;
+
+  auto fill = [](OrderId cl_id, Nanos ts, Qty qty) {
+    ExecReport f{};
+    f.cl_id = cl_id;
+    f.ts = ts;
+    f.px = px_from_cny(78'000.0);
+    f.qty = qty;
+    f.cum = qty;
+    f.leaves = 0;
+    f.inst = 0;
+    f.strategy = 1;
+    f.account = 1;
+    f.type = ExecType::Fill;
+    f.side = Side::Buy;
+    f.offset = Offset::Open;
+    return f;
+  };
+
+  std::uint64_t end_hash = 0, stream_hash = 0, snap_index = 0;
+  {
+    TestSite site(table, sc, TestSite::Mode::Live, banks());
+    FakeGateway gw;
+    site.set_gateway(&gw);
+    PhaseChangeEvt ph{};
+    ph.ts = at_time(9, 0);
+    ph.venue = Venue::SHFE;
+    ph.phase = Phase::Continuous;
+    site.source(ph, ph.ts);
+    site.source(snap(0, 1, at_time(9, 0, 1), 78'000, 78'010, 50, 10), at_time(9, 0, 1));
+    site.source(fill(0x11, at_time(9, 0, 2), 7), at_time(9, 0, 2));
+    // A hot-reloaded limit is part of recovery state: the snapshot must carry
+    // it, not silently revert to the startup config on resume.
+    RiskLimits next = site.risk().limits();
+    next.max_order_qty = 7;
+    RiskLimitsEvt lev{};
+    lev.ts = at_time(9, 0, 2, 500 * kNsPerMs);
+    lev.version = 1;
+    lev.limits = next;
+    site.source(lev, lev.ts);
+    CHECK(save_snapshot(site, snap_file, fp));
+    snap_index = site.stream().next_seq();
+    // More events after the checkpoint: the resume must replay this suffix.
+    site.source(snap(0, 2, at_time(9, 0, 3), 78'010, 78'020, 50, 10), at_time(9, 0, 3));
+    site.source(fill(0x12, at_time(9, 0, 4), 3), at_time(9, 0, 4));
+    end_hash = site.state_hash();
+    stream_hash = site.stream().stream_hash();
+    site.run_eod({}, 0, 0);
+  }
+  JournalReader jr;
+  CHECK(jr.open(jnl));
+  CHECK(jr.sealed() && jr.verified());
+  CHECK(jr.envelopes().size() > snap_index);
+
+  TestSite replay(table, sc, TestSite::Mode::Replay, banks());
+  FakeGateway gw;
+  replay.set_gateway(&gw);
+  SnapshotInfo info;
+  CHECK(load_snapshot(replay, snap_file, fp, info, jr.envelopes().size()));
+  CHECK(info.index == snap_index);
+  for (std::size_t i = 0; i < info.index; ++i) replay.stream().absorb(jr.envelopes()[i]);
+  for (std::size_t i = static_cast<std::size_t>(info.index); i < jr.envelopes().size(); ++i)
+    replay.inject(jr.envelopes()[i]);
+  CHECK(replay.state_hash() == end_hash);
+  CHECK(replay.stream().stream_hash() == stream_hash);
+  CHECK(replay.risk().limits().max_order_qty == 7);  // snapshot carried the reload
+  std::remove(jnl);
+  std::remove(snap_file);
+  std::remove(sess);
+}
+
+// Credentials can come from a permissioned file instead of the config text;
+// the resolver must read exactly the first line and never fall through to an
+// empty/absent value silently.
+void test_secret_resolution() {
+  const char* secret = "plat_secret_test.txt";
+  const char* cfg_path = "plat_secret_test.cfg";
+  {
+    std::FILE* f = std::fopen(secret, "wb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::fputs("  s3cret-value \r\nsecond-line\n", f);
+    std::fclose(f);
+  }
+  {
+    std::FILE* f = std::fopen(cfg_path, "wb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::fputs("password_file = plat_secret_test.txt\n", f);
+    std::fclose(f);
+  }
+  Config c;
+  CHECK(c.load(cfg_path));
+  CHECK(resolve_secret(c, "password") == "s3cret-value");
+  CHECK(resolve_secret(c, "auth_code").empty());
+  std::remove(secret);
+  std::remove(cfg_path);
+}
+
 // -------------------------------------------------- async journal thread
 
 void test_async_journal() {
@@ -279,6 +679,31 @@ void test_async_journal() {
   std::remove(path);
 }
 
+// A faulted journal must NEVER be sealed: an audit record with a hole has to
+// look exactly like a crashed session (unsealed, count derived from the file),
+// so recovery/replay treats it as incomplete instead of certifying it.
+void test_journal_fault_unsealed() {
+  const char* path = "plat_jnl_fault_test.jnl";
+  {
+    AsyncJournal journal;
+    CHECK(journal.open(path, 20'260'713, 1));
+    const auto evt = snap(0, 1, at_time(9, 0), 78'000, 78'010);
+    journal.append(make_envelope(0, evt.ts, evt, Origin::Source, 1));
+    journal.simulate_fault_for_test();
+    journal.finish();
+    CHECK(!journal.healthy());
+  }
+  JournalHeader hdr{};
+  CHECK(JournalReader::peek(path, hdr));
+  CHECK(hdr.magic == kJournalMagic);
+  CHECK(hdr.sealed == 0);  // left exactly like a crash, never certified
+  JournalReader r;
+  CHECK(r.open(path));
+  CHECK(!r.sealed());
+  CHECK(!r.verified());
+  CHECK(r.header().count == 1);  // the bytes are still there for post-mortem
+  std::remove(path);
+}
 
 namespace {
 Nanos timing_now = 0;

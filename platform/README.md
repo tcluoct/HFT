@@ -23,7 +23,7 @@ Deployment (hardware, SDK downloads, broker provisioning, runbook):
 | `plat_bench` | §12.1 budget lines through the *production* dispatch chain (no simulation — synthetic snapshots, capture gateway): tick floor, full order path, adapter-ring one-way. |
 | `platrec` | Standalone market-data recorder: enumerates the whole market, records L1/L2 depth to a compact delta-coded `.mdr` file (~24 B/tick L1, ~56 B/tick L2 vs 216 raw); `--compare` cross-datacenter verify + golden merge (repairs UDP reordering on the venue's cumulative-volume sequence key); `--dump`. Stores instrument specs for self-sufficient backtest. See DEPLOYMENT.md §9; format spec in [MDR_FORMAT.md](MDR_FORMAT.md). |
 | `platbt` | Strategy backtester: replays recorded `.mdr` days through the **same** `Site` + strategies + riskgate + PnL platd runs live (only the venue is a fill simulator), with the identical config keys — so backtest results can't diverge from live. Multi-day: `platbt cfg d1.mdr d2.mdr …`. |
-| `platops` | Web ops console: `platops <cfg>` (same file the fleet runs from) tails every shard's live journal into a Replay-mode **mirror Site** — per-strategy PnL, positions, open orders, fills, risk-limit utilization and alerts reconstructed deterministically a few ms behind live, with zero contact with the trading processes — and drives operator actions (halt/flatten/arm, per-strategy stop, live `param` re-tune, risk-checked manual orders, order cancel, position `transfer` between books) through the per-shard cmd files. Every action enters the engine as a journaled Source envelope: risk-checked, replayable, audited. Loopback-only by default (`ops.port`/`ops.bind`); SSH-tunnel for remote. |
+| `platops` | Web ops console: `platops <cfg>` (same file the fleet runs from) tails every shard's live journal into a Replay-mode **mirror Site** — per-strategy PnL, positions, open orders, fills, risk-limit utilization and alerts reconstructed deterministically a few ms behind live, with zero contact with the trading processes — and drives operator actions (halt/flatten, per-strategy stop, live `param` re-tune, risk-checked manual orders, order cancel, position `transfer` between books) through the per-shard cmd files. Every action enters the engine as a journaled Source envelope: risk-checked, replayable, audited. **HTTP Basic auth** from `ops.user`/`ops.password` on every request (a non-loopback bind without a password is refused); loopback by default, SSH tunnel for remote. |
 
 ## Strategy teams and the desk
 
@@ -190,6 +190,48 @@ leaving (`static_assert(!std::is_polymorphic_v<...>)` in the tests):
 - Kill state is recovery state: the switch snapshots/loads/hashes with the
   gate, and commands carry a monotonic `cmd_seq` so a stale or replayed
   command can never override a newer one.
+- The kill switch has two armed modes, not one: **HALT** refuses every order;
+  **FLATTEN** is reduce-only — it cancels resting orders, then closes every
+  position bucket with IOC orders (split to the firm's max order size, after
+  the scope's orders terminate so the close cannot wash), and keeps opening
+  refused until `disarm`. Riskgate lets reduce-only orders through the kill
+  gate and the throttles during a flatten, and never an order that adds risk.
+- Journal durability is explicit: every drained burst is flushed to the OS
+  (process crash loses nothing), `journal.sync_ms` fsyncs on a cadence and at
+  seal (machine-crash window), and a journal that hit a write error is
+  **never sealed** — it stays unsealed like a crash, never a certified
+  truncated record.
+- Session loss is a halt, not a retry: the driver halts the site on
+  `Down`/`Reconciling` and requires an operator review + re-arm. Automatic
+  reconcile-on-reconnect needs venue trade ids and remains a follow-up.
+- The ops console is authenticated: HTTP Basic from `ops.user`/`ops.password`
+  on every request; a non-loopback bind without a password is refused.
+  `/healthz` is liveness-only; `/metrics` exposes Prometheus gauges (mirror
+  freshness, envelopes, fills, per-strategy realized PnL) behind the same
+  auth. Credentials can come from `*_env` / `*_file` instead of the config
+  text; the example configs ship placeholders, never real passwords.
+- Recovery is checkpointed: `journal.snapshot_sec` writes the deterministic
+  state + envelope index; resume copies the journal prefix (hash+bytes, no
+  dispatch), loads the snapshot and dispatches only the Source suffix. A
+  `<journal>.session` sidecar records build/pack/config/day/site; resume and
+  `--replay` refuse a mismatched composition (the crashed journal itself has
+  no stream hash, so this is the only guard).
+- A previous session with EOD order/fill breaks leaves `<journal>.eod-breaks`;
+  the next start is HALTED until an operator reviews and removes it.
+- Live risk limits reload (`reload` command) is a journaled Source
+  RiskLimitsEvt; the startup limits are journaled first, so recovery uses the
+  limits the session ran with rather than the current config. Rate-ring
+  capacity (`max_actions_per_sec`) stays restart-only. `flatten`/`halt`/
+  `disarm` are the scoped kill modes above.
+- Supervision is production-shaped: fleet shards restart on unexpected exits
+  with bounded exponential backoff, are bound to a JobObject (Windows) /
+  parent-death signal + process group (Linux) so a supervisor crash cannot
+  orphan them, and the fleet refuses a config whose summed per-shard action
+  caps exceed the CSRC HFT envelope.
+- Journal headers carry a schema version (0 = legacy); logs rotate at 64 MiB
+  per session; CI (`.github/workflows/ci.yml`) and `tools/run-qa.ps1` build
+  and run the engine, strategy-team and desk suites plus the offline
+  `platd --check`.
 - Un-forwardable orders/cancels are bounced as Reject/CancelReject — never
   swallowed; reports are session-FIFO through one serialized ring writer.
 - Riskgate rate/day caps default below the 300/s / 20k-day HFT designation
@@ -197,4 +239,5 @@ leaving (`static_assert(!std::is_polymorphic_v<...>)` in the tests):
 
 Build: part of the `hft` solution — `cmake --preset vs2026` at the repo
 root, then `cmake --build build\vs2026 --config Release --target platd
-plat_tests plat_bench`. `/W4` warning-clean; `plat_tests` green (119 checks).
+plat_tests plat_bench`. `/W4` warning-clean; `plat_tests` green (17k+ checks, plus
+the strategy-team and desk suites).

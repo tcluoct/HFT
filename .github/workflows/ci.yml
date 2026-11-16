@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    # The production target is Windows/MSVC (CTP SDK is win64). The runner's
+    # VS 2022 is what the vs2022 preset targets; vs2026 is tried locally.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake --preset vs2022
+
+      - name: Build (Release)
+        run: cmake --build --preset vs2022-release --parallel 4
+
+      - name: Platform engine suite
+        shell: pwsh
+        run: |
+          Push-Location build/vs2022/platform/Release
+          .\plat_tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\platd.exe --check platd.example.cfg | Select-String "config:|strategies"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Strategy and desk suites
+        shell: pwsh
+        run: |
+          $exes = @(
+            "build/vs2022/strategies/trend/Release/strat_trend_tests.exe",
+            "build/vs2022/strategies/fade/Release/strat_fade_tests.exe",
+            "build/vs2022/strategies/basis/Release/strat_basis_tests.exe",
+            "build/vs2022/strategies/cash/Release/strat_cash_tests.exe",
+            "build/vs2022/desk/Release/desk_tests.exe"
+          )
+          foreach ($e in $exes) {
+            & $e
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Benchmark smoke
+        shell: pwsh
+        run: |
+          Push-Location build/vs2022/platform/Release
+          .\plat_bench.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location

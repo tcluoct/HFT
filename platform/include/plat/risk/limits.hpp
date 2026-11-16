@@ -5,8 +5,10 @@
 // from the same file. Split from riskgate.hpp for size only.
 
 #include <cstdint>
+#include <type_traits>
 
 #include "plat/codec/msgs.hpp"
+#include "plat/core/hash.hpp"
 #include "plat/core/time.hpp"
 #include "plat/core/types.hpp"
 
@@ -71,6 +73,54 @@ struct RiskLimits {
   Qty max_stock_holding_qty = 0;
   std::int64_t max_stock_holding_e4 = 0;
 };
+
+// Live risk-limit update (operator `reload`, §10.1). Journaled as a SOURCE
+// envelope so replay re-applies exactly the limits that were in force; the
+// whole struct fits the 256-byte envelope payload (192 bytes today).
+struct RiskLimitsEvt {
+  Nanos ts;
+  std::uint64_t version;
+  RiskLimits limits;
+};
+static_assert(std::is_trivially_copyable_v<RiskLimitsEvt>);
+static_assert(sizeof(RiskLimitsEvt) <= 224, "RiskLimitsEvt must fit the envelope payload");
+
+template <>
+struct MsgTraits<RiskLimitsEvt> {
+  static constexpr Schema schema = Schema::RiskLimits;
+  static constexpr Topic topic = Topic::Risk;
+};
+
+// Stable behavioral identity of the limit set (also used by the session
+// fingerprint). Field-by-field so struct padding never enters a hash.
+inline void mix_limits(StateHash& h, const RiskLimits& l) {
+  h.mix(l.max_order_qty);
+  h.mix(l.max_stock_order_qty);
+  h.mix(l.max_order_notional_e4);
+  h.mix(l.max_net_notional_e4);
+  h.mix(l.max_margin_e4);
+  h.mix(l.max_actions_per_sec);
+  h.mix(l.max_actions_per_day);
+  h.mix(l.cancel_ratio_pct);
+  h.mix(l.cancel_ratio_min_actions);
+  h.mix(l.price_collar_ticks);
+  h.mix(l.max_book_age);
+  h.mix(l.duplicate_window);
+  h.mix(l.duplicate_horizon);
+  h.mix(l.check_close_position);
+  h.mix(l.max_strategy_loss_e4);
+  h.mix(l.max_account_loss_e4);
+  h.mix(l.max_inst_open_qty);
+  h.mix(l.max_inst_cancels);
+  h.mix(l.check_cancel_target);
+  h.mix(l.cancel_retry_after);
+  h.mix(l.stock_cage_bps);
+  h.mix(l.stock_cage_ticks);
+  h.mix(l.stock_cage_etf);
+  h.mix(l.st_daily_buy_qty);
+  h.mix(l.max_stock_holding_qty);
+  h.mix(l.max_stock_holding_e4);
+}
 
 // check_new/check_cancel return this when every check passes.
 inline constexpr RiskCheck kRiskPass = static_cast<RiskCheck>(0);

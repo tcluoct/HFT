@@ -115,6 +115,26 @@ struct StratPack {
   static constexpr const char* kind_name(std::uint8_t k) noexcept {
     return k < kCount ? kNames[k] : "?";
   }
+  // Stable identity of the compiled lineup: names, legacy ids and order. A
+  // journal/recovery is only replayable on the same pack (the bank order is
+  // part of the deterministic state), so a session records this value.
+  static constexpr std::uint64_t fingerprint() noexcept {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto byte = [&h](std::uint64_t b) {
+      h ^= b & 0xff;
+      h *= 1099511628211ull;
+    };
+    const auto word = [&byte](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) byte(v >> (i * 8));
+    };
+    word(kCount);
+    for (std::size_t i = 0; i < kCount; ++i) {
+      for (const char* p = kNames[i]; *p; ++p) byte(static_cast<unsigned char>(*p));
+      byte(0);
+      word(static_cast<std::uint64_t>(kLegacyIds[i]));
+    }
+    return h;
+  }
   // Index of a config `type` value in the pack; kCount when unknown.
   static constexpr std::size_t kind_of(std::string_view type) noexcept {
     for (std::size_t i = 0; i < kCount; ++i)

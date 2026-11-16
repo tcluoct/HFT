@@ -5,6 +5,7 @@
 // come from the deployment environment, not the repo).
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -93,5 +94,34 @@ class Config {
 
   std::map<std::string, std::string> kv_;
 };
+
+// Resolve a credential without putting it in the config file (or the repo):
+//
+//   <key>_env  = ENV_NAME   read the value from the deployment environment
+//   <key>_file = /path      read the first line of a permissioned file
+//   <key>      = value      legacy inline fallback
+//
+// env wins over file, which wins over the inline value. An empty result means
+// "not configured" — callers fail closed rather than trading without the
+// credential. The value is never logged.
+inline std::string resolve_secret(const Config& c, const std::string& key) {
+  const std::string env = c.str(key + "_env");
+  if (!env.empty()) {
+    const char* v = std::getenv(env.c_str());
+    return v ? std::string(v) : std::string{};
+  }
+  const std::string file = c.str(key + "_file");
+  if (!file.empty()) {
+    std::ifstream f(file);
+    if (!f) return {};
+    std::string line;
+    if (!std::getline(f, line)) return {};
+    const auto b = line.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return {};
+    const auto e = line.find_last_not_of(" \t\r\n");
+    return line.substr(b, e - b + 1);
+  }
+  return c.str(key);
+}
 
 }  // namespace plat

@@ -76,8 +76,8 @@ function shardSkeleton(sh){
    <button onclick="ops.post('${n}','status')">status→log</button>
    <button onclick="ops.post('${n}','arm')">arm</button>
    <button onclick="ops.post('${n}','disarm')">disarm</button>
-   <button class="danger" onclick="ops.post('${n}','halt','HALT the whole site? Resting orders are cancelled.')">HALT</button>
-   <button class="danger" onclick="ops.post('${n}','flatten','FLATTEN the whole site? Positions will be closed out.')">FLATTEN</button>
+   <button class="danger" onclick="ops.post('${n}','halt','HALT the whole site? Resting orders are cancelled; no new orders until disarm.')">HALT</button>
+   <button class="danger" onclick="ops.post('${n}','flatten','FLATTEN the whole site? Resting orders are cancelled and every position is closed with IOC orders; opening stays blocked until disarm. Check the log for any leg that could not be closed.')">FLATTEN</button>
   </div>
   <div class="alerts" id="al-${n}"></div>
   <h2>strategies</h2><div id="strat-${n}"></div>
@@ -152,8 +152,8 @@ function render(data){
         <td>${cny(s.realized)}</td><td>${cny(s.unrealized)}</td><td class="dim">${(+s.fees).toFixed(2)}</td><td>${cny(net)}</td>
         <td><button onclick="tuneParam('${n}',${s.id})">tune</button>
             <button onclick="ops.post('${n}','disarm ${s.id}')">run</button>
-            <button class="danger" onclick="ops.post('${n}','halt ${s.id}','Halt strategy ${s.id}?')">halt</button>
-            <button class="danger" onclick="ops.post('${n}','flatten ${s.id}','Flatten strategy ${s.id} positions?')">flatten</button>
+            <button class="danger" onclick="ops.post('${n}','halt ${s.id}','Halt strategy ${s.id}? Resting orders are cancelled; no new orders until disarm.')">halt</button>
+            <button class="danger" onclick="ops.post('${n}','flatten ${s.id}','Flatten strategy ${s.id}? Its positions are closed with IOC orders; opening stays blocked until disarm. Check the log for any leg that could not be closed.')">flatten</button>
         </td></tr>`}).join("")+"</table>";
     $("pos-"+n).innerHTML=`<table><tr><th>strat</th><th>symbol</th><th>Lyd</th><th>Ltd</th>
       <th>Syd</th><th>Std</th><th>net</th><th>cost L/S</th><th>mark</th><th>unrl</th><th></th></tr>`+

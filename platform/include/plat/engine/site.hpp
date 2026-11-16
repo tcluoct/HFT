@@ -68,6 +68,7 @@ struct SiteConfig {
   std::uint32_t day = 0;            // yyyymmdd trading day (from counter login)
   std::string journal_path;         // empty → no journal (tests)
   int journal_core = -1;            // pin the journal writer thread (colo)
+  Nanos journal_sync = 100 * kNsPerMs;  // stable-storage (fsync) cadence; 0 = seal only
   RiskLimits limits{};
   FeeSchedule fees{};
   std::uint16_t epoch = 1;          // order-id epoch (§11.2)
@@ -97,7 +98,8 @@ class Site {
     build_books();
     wire_telemetry();
     if (mode_ == Mode::Live && !cfg_.journal_path.empty()) {
-      journal_open_ = journal_.open(cfg_.journal_path, cfg_.day, cfg_.id, cfg_.journal_core);
+      journal_open_ = journal_.open(cfg_.journal_path, cfg_.day, cfg_.id, cfg_.journal_core,
+                                    cfg_.journal_sync);
       if (journal_open_) stream_.set_journal(&journal_);
     }
   }
@@ -242,6 +244,13 @@ class Site {
   [[nodiscard]] const EodResult& eod() const noexcept { return eod_; }
   [[nodiscard]] const PreFlight& preflight_result() const noexcept { return preflight_result_; }
   [[nodiscard]] bool armed() const noexcept { return go_; }
+
+  // Emergency close-out servicing (FLATTEN kill mode): closes every position
+  // in the armed scope once the scope's resting orders have terminated, so
+  // the close cannot wash against our own working orders. Runs after every
+  // top-level dispatch (deterministic in replay) and is safe for the driver
+  // to call on idle passes; a no-op unless a flatten is pending.
+  void service_flatten();
 
   // End-of-day reconciliation (§11.3) against the counter's own view: the
   // driver queries open orders and fill aggregates from the counter (CTP
@@ -400,6 +409,15 @@ class Site {
   static bool in_kill_scope(const KillSwitchCmd& k, const OmsOrder& o);
   void deny(OrderId id, RiskCheck check, const NewOrderReq& r, bool is_cancel);
 
+  // FLATTEN close-out (site_dispatch.hpp): one pass over the PnL ledger for
+  // the armed scope, emitting IOC closes per position bucket. `scope_has_open`
+  // is the wash-trade guard: no close is sent while an order in the scope is
+  // still live at the venue.
+  void flatten_scope(const KillSwitchCmd& k);
+  [[nodiscard]] bool flatten_scope_has_open(const KillSwitchCmd& k) const;
+  [[nodiscard]] static bool in_flatten_scope(const KillSwitchCmd& k, AccountId a,
+                                             StrategyId s) noexcept;
+
   // Snapshot helpers (site_state.hpp).
   template <typename T>
   static void append_pod(std::vector<std::uint8_t>& out, const T& v);
@@ -440,6 +458,14 @@ class Site {
   AccountId dispatching_account_ = 0;
   SessState sess_state_ = SessState::Down;
   bool recovering_ = false;
+
+  // FLATTEN servicing state (transient, never part of a snapshot): the
+  // command in effect, whether a close-out pass is owed, and re-entrancy
+  // guards for the dispatch wrapper.
+  KillSwitchCmd flatten_cmd_{};
+  bool flatten_pending_ = false;
+  bool flattening_ = false;
+  int dispatch_depth_ = 0;
 
   // Fixed-capacity re-entrancy ring (power of two): drained before any event
   // returns, so it is never part of a snapshot.

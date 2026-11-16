@@ -4,11 +4,13 @@
 // stream hash, §11.1).
 
 #include <cstdio>
+#include <fstream>
 #include <memory>
 
 #include "ThostFtdcMdApi.h"
 #include "plat/bus/journal.hpp"
 #include "plat/core/log.hpp"
+#include "plat/engine/fingerprint.hpp"
 #include "plat/replay/sidecar.hpp"
 #include "platd_app.hpp"
 
@@ -33,13 +35,21 @@ int run_check(const Config& cfg) {
   for (const auto& s : specs)
     std::printf("    `%s` %s id %u account %u\n", s.name.c_str(), kind_name(s.kind), s.id,
                 s.account);
+  if (const std::string cal = cfg.str("trade_calendar"); !cal.empty()) {
+    std::ifstream f(cal);
+    std::printf("  calendar    = %s (%s)\n", cal.c_str(), f ? "readable" : "MISSING");
+    if (!f) ok = false;
+  } else {
+    std::printf("  calendar    = (none — phase timetable trusted)\n");
+  }
   return ok ? 0 : 1;
 }
 
 namespace {
 
 std::unique_ptr<LiveSite> build_replay_site(const Config& cfg, const InstrumentTable& table,
-                                            std::uint32_t day) {
+                                            std::uint32_t day,
+                                            const std::string& jnl_path) {
   SiteConfig sc;
   sc.id = static_cast<SiteId>(cfg.i64("site_id", 1));
   sc.name = cfg.str("site_name", "site");
@@ -54,6 +64,33 @@ std::unique_ptr<LiveSite> build_replay_site(const Config& cfg, const InstrumentT
   // the strategy lineup must come from the SAME config the live run used.
   std::vector<StratSpec> specs;
   if (!parse_strategies(cfg, account, specs)) return nullptr;
+  // The stream-hash check below catches a different Derived stream, but it
+  // only runs AFTER a potentially expensive replay; the fingerprint rejects
+  // a wrong binary/pack/config up front with a precise reason.
+  SessionFingerprint fp;
+  fp.build = build_fingerprint();
+  fp.pack = Pack::fingerprint();
+  fp.config = config_fingerprint(specs, sc.fees, table, sc.hosted,
+                                 sc.limits.max_actions_per_sec);
+  fp.day = sc.day;
+  fp.site = sc.id;
+  SessionFingerprint recorded;
+  if (load_session_fingerprint(jnl_path + ".session", recorded)) {
+    if (!same_fingerprint(recorded, fp)) {
+      logf("replay: COMPOSITION MISMATCH — recorded build %016llx pack %016llx config %016llx "
+           "vs current build %016llx pack %016llx config %016llx; refusing\n",
+           static_cast<unsigned long long>(recorded.build),
+           static_cast<unsigned long long>(recorded.pack),
+           static_cast<unsigned long long>(recorded.config),
+           static_cast<unsigned long long>(fp.build),
+           static_cast<unsigned long long>(fp.pack),
+           static_cast<unsigned long long>(fp.config));
+      return nullptr;
+    }
+  } else {
+    logf("replay: note: no `.session` fingerprint beside the journal — composition not "
+         "pre-verified (legacy record)\n");
+  }
   return std::make_unique<LiveSite>(table, std::move(sc), LiveSite::Mode::Replay,
                                     Pack::banks(cfg, table, specs));
 }
@@ -78,7 +115,7 @@ int run_replay(const Config& cfg, const std::string& jnl_path) {
                  "from file size, no checksum to verify\n",
                  static_cast<unsigned long long>(jr.header().count));
 
-  auto site = build_replay_site(cfg, table, jr.header().day);
+  auto site = build_replay_site(cfg, table, jr.header().day, jnl_path);
   if (!site) {
     logf("replay: strategy configuration is invalid\n");
     return 1;

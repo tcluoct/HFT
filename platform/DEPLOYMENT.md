@@ -137,6 +137,19 @@ Do the whole runbook against **SimNow first** (broker `9999`, AppID
 `simnow_client_test`, AuthCode `0000000000000000`), then swap the six
 credential lines for production.
 
+**Credential handling:** never commit a real password. Set
+`password_env = HFT_CTP_PASSWORD` (read from the process environment) or
+`password_file = C:\secrets\ctp.pass` (first line of a permissioned file);
+the same applies to `auth_code` and `ops.password`. The example configs ship
+`CHANGE_ME` placeholders on purpose. If a real password was ever committed,
+**rotate it at the broker** — removing it from the working tree does not
+remove it from git history.
+
+**Trading calendar:** set `trade_calendar = <file>` (one `yyyymmdd` or
+`yyyymmdd-yyyymmdd` per line, `#` comments) and platd refuses to start when
+the counter's trading day is not listed. Without it, the phase timetable is
+trusted and a holiday/phase typo can trade — set it in production.
+
 ---
 
 ## 5. Install on the server
@@ -183,8 +196,9 @@ operator fixes the cause and types `disarm` then `arm`.
 |---|---|
 | `status` | envelopes / fills / risk pass–deny / session state |
 | `halt` | kill switch: cancel resting orders, deny all new flow |
-| `flatten` | halt + flag for manual position close-out |
+| `flatten` | cancel resting orders **and close every position** with IOC orders; opening stays refused (reduce-only) until `disarm` |
 | `disarm` | re-open the order path (versioned; stale commands lose) |
+| `reload` | re-read `risk.*` from the config and journal a Source limit update (rate-ring size stays restart-only) |
 | `arm` | re-run pre-flight + strategy start |
 | `quit` (or Ctrl-C) | cancel resting orders, reconcile, seal journal, exit |
 
@@ -231,13 +245,14 @@ previous run's story and platd picks the right mode:
 | no file | fresh start |
 | sealed journal (clean EOD) | archive as `<jnl>.<day>.sealed`, fresh start |
 | **unsealed journal, today's date** | **crashed session → AUTO-RESUME** |
+| unsealed journal, today, **no `.session` fingerprint** | refuses auto-resume (fail closed — cannot prove build/pack/config); archive it or use `--resume` for a drill |
 | unsealed journal, older date | archive as `<jnl>.<day>.crashed` + loud warning, fresh start (resume is same-day only) |
 | not a journal / no `.ref` sidecar | archive, fresh start |
 
 Journals are never overwritten — every leftover is archived (with its `.ref`
-sidecar) before a fresh journal opens, so the audit record survives any
-operator mistake. `--resume` remains as a *force* switch (fails rather than
-guessing) for drills and unusual situations.
+and `.session` sidecars) before a fresh journal opens, so the audit record
+survives any operator mistake. `--resume` remains as a *force* switch (fails
+rather than guessing) for drills and unusual situations.
 
 What a resume does:
 
@@ -246,12 +261,23 @@ What a resume does:
    beginning**: there is no cursor to find, because state is a pure function
    of the full Source prefix and full replay at CTP volumes is milliseconds.
    The instrument sidecar restores the exact table; the old journal is kept
-   as `<journal>.crashed`.
+   as `<journal>.crashed`. Durability model: every drained burst reaches the
+   OS (a process crash loses nothing); `journal.sync_ms` is the fsync cadence
+   that bounds a machine-crash window (default 100 ms, `0` = seal only). A
+   journal that hit a **write error is never sealed** — it stays unsealed
+   exactly like a crash, so an incomplete audit record can never be mistaken
+   for a complete one.
 2. The whole prefix replays through a fresh engine with the **gateway
    muted** — strategy slots, OMS, PnL, risk counters and the kill switch are
    rebuilt to the exact crash point (state-hash verified in the tests);
    the new journal re-records the prefix, so the resumed day is one
-   self-contained record again.
+   self-contained record again. Two accelerators/guards apply here: a
+   `<journal>.session` sidecar records build + desk pack + effective config +
+   day/site, and resume/`--replay` refuse a mismatched composition (the
+   crashed journal has no stream hash, so this is the only proof); and with
+   `journal.snapshot_sec` set, the prefix is copied into the new journal
+   without dispatch and only the Source suffix is replayed from the last
+   checkpoint.
 3. The counter is queried account-wide: fills that landed while dead are
    **synthesized as Source exec reports** (journaled — the recovery itself
    replays); orders still working at the venue are **adopted** into the new
@@ -299,7 +325,8 @@ Assignment rules:
   session's volumes; rebalance between sessions, never intraday.
 - **Slice the risk budget**: `risk.*` keys are per shard — the sum across
   shards must stay inside the account's broker/exchange caps (the example
-  file shows a 3-way slice under the 300/s and 20k/day HFT lines).
+  file shows a 3-way slice under the 300/s and 20k/day HFT lines). The
+  supervisor enforces this slice for the action-rate/day caps at startup.
 - **Core map**: shard engines on cores sharing the NIC's NUMA node; each
   journal writer sharing L3 with its engine; leave two cores for the OS and
   CTP api threads.
@@ -308,12 +335,24 @@ Operating a fleet: the supervisor console routes commands — `2 halt` halts
 shard 2, `quit` stops all shards gracefully (as does Ctrl+C). Any terminal
 can command a shard directly: `echo halt > shard2.cmd`. Each shard writes
 `shardN.log`, its own journal, report, and EOD reconciliation (scoped to its
-own CTP session — other shards' orders and fills are not breaks). Stopping
-the supervisor by force (the debugger's Stop button, Task Manager) does not
-take the shards with it — they keep running unsupervised and keep their
-journal files open, so a following fleet start would have two writers per
-journal. Stop a fleet with `quit` or Ctrl+C; if the supervisor is already
-gone, shut its shards down directly with `echo quit > shardN.cmd`.
+own CTP session — other shards' orders and fills are not breaks).
+
+Supervision is active, not just reaping: an unexpectedly-exited shard is
+restarted with bounded exponential backoff (`fleet.restart`,
+`fleet.max_restarts`, `fleet.restart_backoff_ms`, `fleet.restart_max_backoff_ms`);
+a clean EOD exit (code 0) is never restarted. On Windows every child joins a
+JobObject with kill-on-close, and on Linux it gets a parent-death signal and
+its own process group, so stopping the supervisor by force (Task Manager, a
+debugger, a crash) tears the shards down instead of leaving unsupervised
+processes holding journal files. `quit` asks shards to stop gracefully and,
+after `fleet.quit_grace_ms`, terminates whatever is left.
+
+The supervisor also validates the risk slice before starting: the sum of
+per-shard `risk.max_actions_per_sec` / `risk.max_actions_per_day` must stay
+under the 300/s and 20k/day HFT envelope (270/s and 18k/day with the built-in
+buffer), otherwise it refuses to start. Dynamic firm-wide exposure aggregation
+still needs the Phase-2 risk-budget leases (§9.3); the static slice check is
+the Phase-1 guard.
 
 **Why each shard has its own md/td session** (not one shared feed process):
 shards subscribe to *disjoint* instrument sets, so nothing is transmitted or
@@ -355,7 +394,10 @@ exactly that); the engines don't change, only the ring's source does.
   (persistent denials = a strategy/limit mismatch worth investigating).
 - EOD report: `EOD recon: order breaks 0 fills OK` is the green line.
   Anything else blocks the next session until explained.
-- Journal + `.ref` + report files are the audit set — archive daily.
+- Journal + `.ref` + `.session` + report files are the audit set — archive
+  daily. The `.session` sidecar is the composition proof for resume/replay;
+  `<journal>.snap` is a recovery accelerator and may be discarded (the
+  journal alone still replays).
 
 ## 8b. Web ops console (`platops`)
 
@@ -380,14 +422,31 @@ standalone keys). Open `http://127.0.0.1:8848/`.
   manual orders pass the full 20-check riskgate, everything replays in the
   recovery drill, and the journal is the regulator-grade audit trail of who
   did what when.
-- **Security model:** binds `127.0.0.1` by default and has no auth — treat it
-  like the stdin console. For remote access use an SSH tunnel
-  (`ssh -L 8848:127.0.0.1:8848 <colo-host>`); do NOT bind `0.0.0.0` on a
-  shared network.
+- **Security model:** the console is an authenticated control plane. Every
+  request needs HTTP Basic auth from `ops.user`/`ops.password`; a bind to a
+  non-loopback address without a password is **refused**, not exposed. The
+  default (`127.0.0.1`, loopback) still works without a password for dev, with
+  a loud warning. Basic auth (rather than a cookie token) also closes the CSRF
+  hole: a cross-origin page cannot attach the `Authorization` header without a
+  CORS preflight the server never answers. For remote access prefer an SSH
+  tunnel (`ssh -L 8848:127.0.0.1:8848 <colo-host>`). The per-shard
+  `shardN.cmd` files are an OS-permission boundary: keep the runtime directory
+  owned by the trading user only.
 - `param` keys are each strategy's whitelisted config keys (`lots`,
   `take_ticks`, `stop_ticks`, `timeout_ms`, `imb_gate_e4`, `max_entries`,
   plus the type-specific gates). Structural keys (universe, ids, EMA shape)
   remain restart-only by design.
+- `/healthz` is an unauthenticated liveness probe (`ok`); `/metrics` exposes
+  Prometheus gauges behind the same Basic auth — per-shard envelopes, fills,
+  market-data age, and per-strategy realized PnL. Point an external monitor
+  at both; the web page remains the human view.
+- `reload` re-reads `risk.*` from the same config file (including the shard
+  overlay), journals a Source `RiskLimitsEvt`, and applies it on the engine
+  thread. `max_actions_per_sec` cannot change live (the rate ring is sized at
+  construction); everything else can. The startup limit set is journaled as
+  the first Source event, and each reload after it, so resume/replay recovers
+  the limits the session actually ran with — not whatever the config says at
+  resume time.
 - `transfer` is bookkeeping only (moves lots + cost basis between strategy
   books, yd first); to change the account's actual exposure use `order` or
   `flatten`.
@@ -500,11 +559,36 @@ metrics in `plat/rec/backtest_report.hpp`.
 ## 10. Known Phase-1 limits (by design, see ARCHITECTURE.md)
 
 - One venue, one account, one strategy instance per process; multi-site
-  federation (the arb bridge) is Phase 2.
+  federation (the arb bridge) is Phase 2. Warm standby is not wired: the
+  snapshot + journal replay path is the takeover procedure, but the
+  shared-memory transport a live standby needs is a Phase-2 item.
 - Stock venues (SSE/SZSE) need the ATP/相关柜台 adapters — the book engine
   and T+1 ledger are already in place behind the same boundaries.
-- After a mid-session disconnect the api relogs in automatically, but
-  position/order state re-sync is the EOD reconciliation + operator's
-  judgment; a full automatic reconcile-on-reconnect is a listed follow-up.
-- Kill-switch `flatten` cancels resting orders; position liquidation stays a
-  human action in v1.
+- Dynamic firm-wide exposure across shards is not enforced pre-trade (each
+  shard's riskgate is local); the supervisor validates the static action-rate
+  slice, and the Phase-2 risk-budget leases are the design for the rest.
+- The CTP order registry is a mutex-guarded `std::map`: correct, but it
+  allocates and takes a lock on the order path (a latency-tail item, not a
+  correctness one). Replacing it with a fixed-capacity table is a measured
+  optimization, not a safety fix.
+- An md front disconnect is logged but not surfaced as a site state; the
+  riskgate stale-book interlock refuses new orders after `risk.max_book_age`
+  (default 5 s). The ops page shows feed age.
+- The journal header carries a schema version (0 = legacy), but messages are
+  fixed-layout structs. Long-retention regulatory archives should be exported
+  through the canonical wirecodec encoding rather than relying on a future
+  build's struct layout.
+- After a mid-session disconnect the api relogs in automatically, but the
+  driver **halts the site** on `Down`/`Reconciling` and keeps it halted until
+  an operator reviews positions/orders against the counter and re-arms; it
+  never silently resumes trading on a reconnect. A full automatic
+  reconcile-on-reconnect (querying open orders/trades and synthesizing the
+  missed reports) is a listed follow-up — it needs venue trade ids for safe
+  dedup, so it is deliberately not guessed.
+- Kill-switch `flatten` now **closes positions** (cancels resting orders, then
+  sends IOC closes per position bucket, split to the firm's max order size,
+  after the scope's orders have terminated to avoid a wash). It stays
+  reduce-only until `disarm`. It can still be blocked by a closed phase, a
+  stale book, no price, or a cancel-lock phase with resting orders (the close
+  waits for the scope's orders to terminate, and cancels are not accepted in
+  every phase): every such leg is logged, and the operator must finish by hand.

@@ -18,6 +18,21 @@ if(NOT TARGET hft::common)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../common ${CMAKE_CURRENT_BINARY_DIR}/common)
 endif()
 
+# Build identity for the session fingerprint (engine/fingerprint.hpp): a
+# journal is only resumed/replayed on the build that produced it. `git
+# describe --dirty` distinguishes a locally modified tree; "dev" if git is
+# unavailable (a source tarball), which still separates it from a commit id.
+execute_process(
+  COMMAND git describe --always --dirty
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE HFT_BUILD_ID
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET)
+if(NOT HFT_BUILD_ID)
+  set(HFT_BUILD_ID "dev")
+endif()
+message(STATUS "platform: build id = ${HFT_BUILD_ID}")
+
 # The platform is the labs' graduation (docs/platform/ARCHITECTURE.md §20):
 # header-only component libraries composed into the production site daemon.
 #
@@ -96,6 +111,8 @@ set(PLAT_HEADERS
   include/plat/engine/site_state.hpp
   include/plat/engine/pack.hpp
   include/plat/engine/params.hpp
+  include/plat/engine/fingerprint.hpp
+  include/plat/engine/snapshot.hpp
   include/plat/testing/harness.hpp
   include/plat/tel/telemetry.hpp
   include/plat/tel/latency.hpp
@@ -155,7 +172,7 @@ set(PLATD_SOURCES
 # Docs + example configs, shown in Visual Studio under the project each one
 # belongs to (the config lands beside its exe via a POST_BUILD copy too).
 set(PLATD_DOCS README.md DEPLOYMENT.md MDR_FORMAT.md
-               platd.example.cfg platd.fleet.example.cfg)
+               platd.example.cfg platd.fleet.example.cfg trade_calendar.example.txt)
 set(PLATBT_DOCS backtest.example.cfg)
 set(PLATREC_DOCS platrec.example.cfg)
 set(ACCREP_DOCS accrep.example.cfg)
@@ -232,6 +249,7 @@ endif()
 # need a lineup link the desk on top.
 add_library(platform_lib STATIC src/plat_lib.cpp ${PLAT_HEADERS})
 target_link_libraries(platform_lib PUBLIC strat_sdk)  # include paths come with it
+target_compile_definitions(platform_lib PUBLIC HFT_BUILD_ID="${HFT_BUILD_ID}")
 set_target_properties(platform_lib PROPERTIES FOLDER ${PROJECT_NAME})
 if(MSVC)
   target_compile_options(platform_lib PRIVATE /utf-8 /EHsc)
@@ -312,7 +330,7 @@ add_custom_command(TARGET platbt POST_BUILD
 add_executable(platops
   src/platops_main.cpp src/platops_app.hpp src/platops_json.hpp src/platops_web.hpp
   src/fleet_cfg.hpp
-  include/plat/ops/tail.hpp include/plat/ops/http.hpp)
+  include/plat/ops/auth.hpp include/plat/ops/tail.hpp include/plat/ops/http.hpp)
 hft_configure(platops)
 target_link_libraries(platops PRIVATE desk)
 if(WIN32)

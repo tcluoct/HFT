@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "plat/bus/journal.hpp"
+#include "plat/ops/auth.hpp"
 #include "plat/ops/tail.hpp"
 #include "plat/pnl/pnl.hpp"
 #include "plat/replay/sidecar.hpp"
@@ -28,6 +29,26 @@ ParamUpdateEvt param_evt(Nanos ts, StrategyId s, const char* key, std::int64_t v
 }
 
 }  // namespace
+
+// The ops console is an authenticated control plane: the Basic credential is
+// precomputed server-side and compared in constant time; scheme matching is
+// case-insensitive; an empty expected token is the explicit loopback-dev
+// "auth disabled" mode.
+void test_ops_http_auth() {
+  using namespace plat::ops;
+  CHECK(base64_encode("ops:secret") == "b3BzOnNlY3JldA==");
+  CHECK(base64_encode("a") == "YQ==");
+  CHECK(base64_encode("ab") == "YWI=");
+  const std::string token = basic_token("ops", "s3cr3t!");
+  CHECK(token.rfind("Basic ", 0) == 0);
+  CHECK(basic_auth_ok(token, token));
+  CHECK(basic_auth_ok("basic " + token.substr(6), token));  // scheme is case-insensitive
+  CHECK(!basic_auth_ok("", token));
+  CHECK(!basic_auth_ok("Basic ", token));
+  CHECK(!basic_auth_ok("Basic wrong-token", token));
+  CHECK(!basic_auth_ok("Bearer " + token.substr(6), token));
+  CHECK(basic_auth_ok("", ""));  // explicit dev mode: auth disabled
+}
 
 // A journaled ParamUpdateEvt re-tunes exactly the addressed instance.
 void test_ops_param_update() {
@@ -298,8 +319,9 @@ void test_ops_mirror() {
   CHECK(sh.ops_log().size() == 3);  // param + manual order + transfer
   const Position* moved = sh.site()->pnl().find(1, 2, 0);
   CHECK(moved && moved->long_td == 2);
-  CHECK(sh.site()->oms().open_orders(0).size() == 1);
-  CHECK(sh.site()->oms().open_orders(0)[0]->cl_id == manual_id);
+  const auto resting = sh.site()->oms().open_orders(0);
+  CHECK(resting.size() == 1);
+  if (resting.size() == 1) CHECK(resting[0]->cl_id == manual_id);
 
   // And the JSON document the web page polls carries the essentials.
   std::vector<std::unique_ptr<platops::MirrorShard>> shards;

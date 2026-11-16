@@ -17,8 +17,10 @@
 #include "plat/bus/ring.hpp"
 #include "plat/core/log.hpp"
 #include "plat/ctp/md_client.hpp"
+#include "plat/engine/fingerprint.hpp"
 #include "plat/engine/live.hpp"
 #include "plat/engine/report.hpp"
+#include "plat/engine/snapshot.hpp"
 #include "plat/replay/sidecar.hpp"
 #include "platd_app.hpp"
 
@@ -180,12 +182,33 @@ void archive_journal(const std::string& path, std::uint32_t day, const char* tag
     std::filesystem::rename(path + ".ref", target + ".ref", ec);
   if (std::filesystem::exists(path + ".positions", ec))
     std::filesystem::rename(path + ".positions", target + ".positions", ec);
+  if (std::filesystem::exists(path + ".session", ec))
+    std::filesystem::rename(path + ".session", target + ".session", ec);
+  if (std::filesystem::exists(path + ".snap", ec))
+    std::filesystem::rename(path + ".snap", target + ".snap", ec);
   logf("[platd] archived previous journal -> %s\n", target.c_str());
+}
+
+// Live risk-limit reload: re-read the same file the session started from (and
+// the same shard overlay) and hand the limits to the driver, which journals a
+// Source RiskLimitsEvt. Credentials are irrelevant here; only risk.* is used.
+struct ReloadContext {
+  std::string path;
+  int shard = 0;
+};
+
+bool reload_limits(void* ctx, RiskLimits& out) {
+  auto* rc = static_cast<ReloadContext*>(ctx);
+  Config fleet;
+  if (!fleet.load(rc->path)) return false;
+  Config c = rc->shard > 0 ? shard_config(fleet, rc->shard) : fleet;
+  out = limits_from(c);
+  return true;
 }
 
 }  // namespace
 
-int run_live(const Config& cfg, bool force_resume) {
+int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, int shard) {
   // ---- persistent log FIRST: the session story (start-mode decision,
   // resume/reconcile, incidents, and the crash handler's post-mortem) must
   // survive the process — a console line is gone the moment the window is.
@@ -210,10 +233,10 @@ int run_live(const Config& cfg, bool force_resume) {
   tc.front = cfg.str("td_front");
   tc.broker_id = cfg.str("broker_id");
   tc.user_id = cfg.str("user_id");
-  tc.password = cfg.str("password");
+  tc.password = resolve_secret(cfg, "password");
   tc.investor_id = cfg.str("investor_id", cfg.str("user_id"));
   tc.app_id = cfg.str("app_id");
-  tc.auth_code = cfg.str("auth_code");
+  tc.auth_code = resolve_secret(cfg, "auth_code");
   tc.flow_path = cfg.str("td_flow_path", "ctp_td_flow/");
   tc.epoch = static_cast<std::uint16_t>(cfg.i64("epoch", 1));
   std::error_code fs_ec;
@@ -226,11 +249,31 @@ int run_live(const Config& cfg, bool force_resume) {
     return 1;
   }
 
+  // ---- trading calendar (optional but recommended): a configured calendar
+  // that does not list today means a holiday/half-day misconfiguration —
+  // refuse to trade rather than trust the phase timetable.
+  if (const std::string cal = cfg.str("trade_calendar"); !cal.empty()) {
+    if (!is_trading_day(cal, trader.trading_day())) return 1;
+  } else {
+    logf("[platd] note: no `trade_calendar` configured — the phase timetable is trusted\n");
+  }
+
   // ---- instrument master. Fresh start: counter queries (§9.6). Resume: the
   // crashed session's sidecar is authoritative — InstrumentIds inside the
   // journal are indexes into THAT table, and the trading day hasn't changed.
   const auto symbols = cfg.list("instruments");
   const std::string jnl_path = cfg.str("journal", "platd.jnl");
+  // EOD break gate: a previous session whose reconciliation against the
+  // counter found open-order or fill breaks leaves this marker. The next
+  // session starts HALTED until an operator reviews the report and removes
+  // it — a break must never be silently traded through.
+  const std::string eod_breaks_path = jnl_path + ".eod-breaks";
+  std::error_code breaks_ec;
+  const bool eod_breaks_pending = std::filesystem::exists(eod_breaks_path, breaks_ec);
+  if (eod_breaks_pending)
+    logf("[platd] EOD BREAKS PENDING from a previous session (%s) — this site will start "
+         "HALTED; review the EOD report, then delete the marker and `disarm` + `arm`\n",
+         eod_breaks_path.c_str());
   InstrumentTable table;
   std::vector<InstrumentId> hosted;
   Venue site_venue = Venue::SHFE;
@@ -404,11 +447,83 @@ int run_live(const Config& cfg, bool force_resume) {
   sc.day = trader.trading_day();
   sc.journal_path = jnl_path;
   sc.journal_core = static_cast<int>(cfg.i64("journal_core", -1));
+  // Stable-storage cadence: a machine crash loses at most this window; a
+  // process crash loses nothing (every burst is flushed to the OS).
+  sc.journal_sync = cfg.i64("journal.sync_ms", 100) * kNsPerMs;
   sc.limits = limits_from(cfg);
   sc.fees = fees_from(cfg);
   sc.epoch = tc.epoch;
+
+  // ---- session fingerprint: the composition that produced this journal.
+  // The crashed journal is unsealed (no stream hash), so this sidecar is the
+  // only way resume can prove the binary/pack/config match the dead session.
+  SessionFingerprint session_fp;
+  session_fp.build = build_fingerprint();
+  session_fp.pack = Pack::fingerprint();
+  session_fp.config = config_fingerprint(specs, sc.fees, table, hosted,
+                                         sc.limits.max_actions_per_sec);
+  session_fp.day = sc.day;
+  session_fp.site = sc.id;
+  const std::string session_path = sc.journal_path + ".session";
+  const std::string snap_path = sc.journal_path + ".snap";
+  if (!resume) {
+    // A snapshot without the crashed journal it belongs to is stale state; a
+    // fresh session must never adopt it.
+    std::error_code snap_ec;
+    std::filesystem::remove(snap_path, snap_ec);
+  }
+  if (resume) {
+    SessionFingerprint recorded;
+    if (!load_session_fingerprint(session_path, recorded)) {
+      if (!force_resume) {
+        logf("[resume] no `.session` fingerprint beside the crashed journal — cannot prove the "
+             "binary/pack/config match; refusing AUTO-RESUME (use --resume for a drill, or "
+             "archive the journal and start fresh)\n");
+        return 1;
+      }
+      logf("[resume] WARNING: no session fingerprint (forced resume) — composition cannot be "
+           "verified\n");
+    } else if (!same_fingerprint(recorded, session_fp)) {
+      logf("[resume] COMPOSITION MISMATCH — refusing to replay the crashed journal:\n"
+           "  recorded build %016llx pack %016llx config %016llx day %u site %u\n"
+           "  current  build %016llx pack %016llx config %016llx day %u site %u\n",
+           static_cast<unsigned long long>(recorded.build),
+           static_cast<unsigned long long>(recorded.pack),
+           static_cast<unsigned long long>(recorded.config), recorded.day, recorded.site,
+           static_cast<unsigned long long>(session_fp.build),
+           static_cast<unsigned long long>(session_fp.pack),
+           static_cast<unsigned long long>(session_fp.config), session_fp.day,
+           session_fp.site);
+      return 1;
+    }
+    std::error_code sec;
+    std::filesystem::remove(jnl_path + ".crashed.session", sec);
+    std::filesystem::rename(session_path, jnl_path + ".crashed.session", sec);
+  }
+  if (!save_session_fingerprint(session_path, session_fp)) {
+    logf("[platd] cannot write session fingerprint %s — refusing to trade\n",
+         session_path.c_str());
+    return 1;
+  }
+
   LiveSite site(table, sc, LiveSite::Mode::Live, Pack::banks(cfg, table, specs));
   site.set_gateway(&trader);
+  if (!resume) {
+    // Pin the startup limits into the journal. Replay/recovery therefore uses
+    // the limits the session actually started with, not whatever the config
+    // file says at resume time; later `reload`s are journaled events too.
+    RiskLimitsEvt initial{};
+    initial.ts = live_now_ns();
+    initial.version = 0;
+    initial.limits = sc.limits;
+    site.source(initial, initial.ts);
+    logf("[platd] journaled initial risk limits: max_order_qty %lld, actions/s %u, "
+         "day %u\n",
+         static_cast<long long>(sc.limits.max_order_qty), sc.limits.max_actions_per_sec,
+         sc.limits.max_actions_per_day);
+  }
+  if (eod_breaks_pending)
+    site.command_kill(KillScope::Site, KillAction::Halt, 0, live_now_ns());
 
   // Operator-configured order/cancel-count alerts (§10.2) — off by default;
   // set comp.order_count_alert / comp.cancel_count_alert to exercise them.
@@ -427,21 +542,49 @@ int run_live(const Config& cfg, bool force_resume) {
   save_sidecar(sc.journal_path, table);
 
   if (resume) {
-    // ---- crash recovery (§11.2): replay the crashed prefix through the
-    // live site — the gateway is muted, so state rebuilds without a single
-    // byte leaving the building — then reconcile with the counter and start
-    // HALTED for operator review (`disarm` + `arm` to trade again).
+    // ---- crash recovery (§11.2): restore the prefix as fast as possible.
+    // A periodic snapshot (journal.snapshot_sec) lets us load the state at
+    // envelope K, re-create the journal prefix (hash + bytes, no dispatch)
+    // and dispatch only the Source suffix. No snapshot → full replay.
     site.set_recovering(true);
     std::uint64_t injected = 0;
-    for (const Envelope& e : crashed.envelopes()) {
-      if (e.origin == Origin::Source) ++injected;
-      site.inject(e);
+    const std::size_t total = crashed.envelopes().size();
+    SnapshotInfo snap_info;
+    bool used_snapshot = false;
+    if (load_snapshot(site, snap_path, session_fp, snap_info, total)) {
+      for (std::size_t i = 0; i < snap_info.index; ++i)
+        site.stream().absorb(crashed.envelopes()[i]);
+      for (std::size_t i = static_cast<std::size_t>(snap_info.index); i < total; ++i) {
+        const Envelope& e = crashed.envelopes()[i];
+        if (e.origin == Origin::Source) ++injected;
+        site.inject(e);
+      }
+      used_snapshot = true;
+      logf("[resume] snapshot at envelope %llu loaded — replayed %zu suffix envelope(s) "
+           "(%llu source) instead of the full %zu\n",
+           static_cast<unsigned long long>(snap_info.index), total - snap_info.index,
+           static_cast<unsigned long long>(injected), total);
+    } else {
+      for (const Envelope& e : crashed.envelopes()) {
+        if (e.origin == Origin::Source) ++injected;
+        site.inject(e);
+      }
+      logf("[resume] no usable snapshot — full replay of %zu envelope(s)\n", total);
     }
     site.set_recovering(false);
+    {
+      std::error_code snap_ec;
+      if (used_snapshot) {
+        std::filesystem::remove(jnl_path + ".crashed.snap", snap_ec);
+        std::filesystem::rename(snap_path, jnl_path + ".crashed.snap", snap_ec);
+      } else {
+        std::filesystem::remove(snap_path, snap_ec);  // stale for the new journal
+      }
+    }
     logf("[resume] replayed %llu source envelopes — state hash %016llx at crash "
                  "point\n",
-                 static_cast<unsigned long long>(injected),
-                 static_cast<unsigned long long>(site.state_hash()));
+         static_cast<unsigned long long>(injected),
+         static_cast<unsigned long long>(site.state_hash()));
 
     // Gate by the phase in effect NOW (the replayed phase is crash-time's).
     PhaseChangeEvt pe{};
@@ -466,7 +609,7 @@ int run_live(const Config& cfg, bool force_resume) {
   mc.front = cfg.str("md_front");
   mc.broker_id = cfg.str("broker_id");
   mc.user_id = cfg.str("user_id");
-  mc.password = cfg.str("password");
+  mc.password = resolve_secret(cfg, "password");
   mc.flow_path = cfg.str("md_flow_path", "ctp_md_flow/");
   std::filesystem::create_directories(mc.flow_path, fs_ec);
   ctp::MdClient md(mc, md_ring, &live_now_ns);
@@ -484,7 +627,42 @@ int run_live(const Config& cfg, bool force_resume) {
   LiveDriver<LiveSite> driver(site, md_ring, trade_ring, schedule_from(cfg), opt);
   EodBridge eod{&trader};
   driver.set_eod_query(&EodBridge::query, &eod);
+  ReloadContext reload_ctx{cfg_path, shard};
+  driver.set_limits_loader(&reload_limits, &reload_ctx);
+  // Checkpoint cadence: a restart replays at most this window (0 disables).
+  driver.set_snapshot(snap_path, cfg.i64("journal.snapshot_sec", 300) * kNsPerSec,
+                      session_fp);
   driver.run();
+
+  // ---- EOD reconciliation gate (§11.3). Any order/fill break against the
+  // counter must be reviewed before the next session trades: leave a marker
+  // that starts the next run HALTED. A clean reconciliation clears it.
+  if (site.eod().ran) {
+    const auto& eod_result = site.eod();
+    if (eod_result.order_breaks > 0 || !eod_result.fills_ok) {
+      std::FILE* f = std::fopen(eod_breaks_path.c_str(), "wb");
+      if (f) {
+        std::fprintf(f,
+                     "day=%u site=%u order_breaks=%zu fills_ok=%d venue_buy=%lld "
+                     "venue_sell=%lld\nreview the EOD report, then delete this file and "
+                     "`disarm` + `arm`\n",
+                     sc.day, static_cast<unsigned>(sc.id), eod_result.order_breaks,
+                     eod_result.fills_ok ? 1 : 0, static_cast<long long>(eod_result.venue_buy),
+                     static_cast<long long>(eod_result.venue_sell));
+        std::fclose(f);
+        logf("[platd] EOD BREAKS: %zu order break(s), fills %s — wrote %s; the next "
+             "session starts HALTED until this is reviewed\n",
+             eod_result.order_breaks, eod_result.fills_ok ? "OK" : "BREAK",
+             eod_breaks_path.c_str());
+      } else {
+        logf("[platd] ERROR: EOD BREAKS and cannot write %s — next start will NOT be gated\n",
+             eod_breaks_path.c_str());
+      }
+    } else {
+      std::error_code clear_ec;
+      std::filesystem::remove(eod_breaks_path, clear_ec);
+    }
+  }
 
   // ---- per-strategy attribution for tomorrow's carry-in.
   write_eod_positions(site, table, jnl_path);

@@ -44,6 +44,7 @@ void Site<Gateway, Strats...>::wire_telemetry() {
 
 template <OrderGateway Gateway, AnyStrategy... Strats>
 void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_begin) {
+  ++dispatch_depth_;
   cur_ts_ = e.ts;
   ++*c_envelopes_;
   switch (e.schema) {
@@ -118,16 +119,42 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_b
       route(e);
       break;
     }
-    case Schema::KillSwitch: {
-      const auto& k = e.as<KillSwitchCmd>();
+    case Schema::RiskLimits: {
+      const auto& ev = e.as<RiskLimitsEvt>();
+      if (risk_.set_limits(ev.limits))
+        logf("[site] risk limits reloaded (v%llu)\n",
+             static_cast<unsigned long long>(ev.version));
+      else
+        logf("[site] risk limits update REJECTED (v%llu): invalid, or max_actions_per_sec "
+             "changed (rate-ring size is restart-only)\n",
+             static_cast<unsigned long long>(ev.version));
+      break;
+    }
+    case Schema::KillSwitch: {      const auto& k = e.as<KillSwitchCmd>();
       risk_.kill().apply(k);
-      // Halt/Flatten pull resting orders (§10.3). Cancels ride the normal
-      // path — riskgate permits cancels under halt. Position flattening is
-      // the strategies' close-out logic against a halted book, kept manual
-      // in v1 (§10.3 lists it as the second, human-confirmed stage).
-      if (k.action != KillAction::Disarm) {
-        for (const OmsOrder* o : open_orders_snapshot())  // cold: operator action
-          if (in_kill_scope(k, *o)) cancel(o->cl_id);
+      if (k.action == KillAction::Disarm) {
+        // Disarming stands the emergency close-out down; positions stay as
+        // they are (the operator has taken over again).
+        flatten_pending_ = false;
+        break;
+      }
+      // HALT and FLATTEN both pull resting orders (§10.3). Cancels ride the
+      // normal path — riskgate permits cancels under an armed scope. FLATTEN
+      // additionally owes a close-out pass: service_flatten() runs at the end
+      // of this dispatch (and after the cancels terminate) and closes every
+      // position in scope with IOC orders. HALT never sends a close.
+      for (const OmsOrder* o : open_orders_snapshot())  // cold: operator action
+        if (in_kill_scope(k, *o)) cancel(o->cl_id);
+      if (k.action == KillAction::Flatten) {
+        const char* scope = k.scope == KillScope::Site    ? "site"
+                            : k.scope == KillScope::Firm  ? "firm"
+                            : k.scope == KillScope::Account ? "account"
+                                                            : "strategy";
+        flatten_cmd_ = k;
+        flatten_pending_ = true;
+        logf("[site] FLATTEN armed (%s %u): resting orders cancelled; positions in scope "
+             "will be closed with IOC orders\n",
+             scope, static_cast<unsigned>(k.target));
       }
       break;
     }
@@ -177,6 +204,11 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_b
       break;
     }
   }
+  // Only the OUTERMOST dispatch services the emergency close-out: a nested
+  // publish (strategy order → deny → strategy) must finish first, and replay
+  // calls dispatch() for the same Source envelopes, so the close-out lands at
+  // exactly the same journal position in live and replay.
+  if (--dispatch_depth_ == 0 && flatten_pending_) service_flatten();
 }
 
 template <OrderGateway Gateway, AnyStrategy... Strats>
@@ -254,6 +286,16 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_exec_report(const Envelope& e
     if (StockBook* b = stock_books_[r.inst].get()) b->track_own(r.venue_no);
   latency_.record(LatencyStage::ResponseUpdate, update_begin, latency_.now());
   route(e);
+  // FLATTEN is a standing instruction until disarmed: a fill that still adds
+  // exposure (a pre-flatten order that reached the venue before our cancel)
+  // re-arms the close-out so the book cannot drift away from flat unnoticed.
+  if (r.type == ExecType::Fill && flatten_cmd_.action == KillAction::Flatten &&
+      risk_.kill().mode(r.account, r.strategy) == KillMode::Flatten &&
+      in_flatten_scope(flatten_cmd_, r.account, r.strategy)) {
+    const bool adds =
+        table_->at(r.inst).is_stock() ? r.side == Side::Buy : r.offset == Offset::Open;
+    if (adds) flatten_pending_ = true;
+  }
 }
 
 // Strategies never re-enter: an envelope produced *during* a strategy
@@ -425,6 +467,136 @@ void Site<Gateway, Strats...>::deny(OrderId id, RiskCheck check, const NewOrderR
   ++*c_deny_check_[static_cast<int>(check)];
   last_deny_ = d;
   dispatch(stream_.seal(cur_ts_, d, Origin::Derived));
+}
+
+// ------------------------------------------------- FLATTEN close-out
+
+template <OrderGateway Gateway, AnyStrategy... Strats>
+bool Site<Gateway, Strats...>::in_flatten_scope(const KillSwitchCmd& k, AccountId a,
+                                                StrategyId s) noexcept {
+  switch (k.scope) {
+    case KillScope::Firm:
+    case KillScope::Site: return true;
+    case KillScope::Account: return a == k.target;
+    case KillScope::Strategy: return s == k.target;
+  }
+  return false;
+}
+
+template <OrderGateway Gateway, AnyStrategy... Strats>
+bool Site<Gateway, Strats...>::flatten_scope_has_open(const KillSwitchCmd& k) const {
+  for (const OmsOrder* o : open_orders_snapshot())
+    if (in_flatten_scope(k, o->account, o->strategy)) return true;
+  return false;
+}
+
+template <OrderGateway Gateway, AnyStrategy... Strats>
+void Site<Gateway, Strats...>::service_flatten() {
+  if (!flatten_pending_ || flattening_) return;
+  if (flatten_cmd_.action != KillAction::Flatten) {
+    flatten_pending_ = false;  // disarmed / superseded
+    return;
+  }
+  // Wash-trade guard: do not send the close while an order in the scope is
+  // still live at the venue. Cancels were dispatched with the command; the
+  // venue's terminal reports drive the next servicing pass.
+  if (flatten_scope_has_open(flatten_cmd_)) return;
+  flattening_ = true;
+  flatten_pending_ = false;
+  flatten_scope(flatten_cmd_);
+  flattening_ = false;
+}
+
+template <OrderGateway Gateway, AnyStrategy... Strats>
+void Site<Gateway, Strats...>::flatten_scope(const KillSwitchCmd& k) {
+  struct Leg {
+    AccountId account;
+    StrategyId strategy;
+    InstrumentId inst;
+    Side side;
+    Offset offset;
+    Qty qty;
+  };
+  std::vector<Leg> legs;
+  // Deterministic walk: PnlLedger::for_each iterates its ordered map, so the
+  // close orders (and therefore the journal) are identical on replay.
+  pnl_.for_each([&](const PosKey& key, const Position& p) {
+    if (!in_flatten_scope(k, key.account, key.strategy)) return;
+    if (key.inst >= table_->size()) return;
+    if (!has_fut_[key.inst] && !stock_books_[key.inst]) return;  // not hosted here
+    const Instrument& in = table_->at(key.inst);
+    if (in.is_stock()) {
+      if (p.sellable > 0)
+        legs.push_back({key.account, key.strategy, key.inst, Side::Sell, Offset::Open,
+                        p.sellable});
+      return;
+    }
+    if (p.long_td > 0)
+      legs.push_back({key.account, key.strategy, key.inst, Side::Sell, Offset::CloseToday,
+                      p.long_td});
+    if (p.long_yd > 0)
+      legs.push_back({key.account, key.strategy, key.inst, Side::Sell, Offset::CloseYesterday,
+                      p.long_yd});
+    if (p.short_td > 0)
+      legs.push_back({key.account, key.strategy, key.inst, Side::Buy, Offset::CloseToday,
+                      p.short_td});
+    if (p.short_yd > 0)
+      legs.push_back({key.account, key.strategy, key.inst, Side::Buy, Offset::CloseYesterday,
+                      p.short_yd});
+  });
+  if (legs.empty()) {
+    logf("[site] FLATTEN: scope already flat\n");
+    return;
+  }
+  std::size_t sent = 0, denied = 0, skipped = 0;
+  for (const Leg& l : legs) {
+    const Instrument& in = table_->at(l.inst);
+    Price px = 0;
+    if (in.is_stock()) {
+      const StockBook* b = stock_books_[l.inst].get();
+      if (!b) {
+        ++skipped;
+        continue;
+      }
+      const auto top = b->top();
+      px = l.side == Side::Sell ? top.bid_px : top.ask_px;
+    } else {
+      const FutBook* b = has_fut_[l.inst] ? &fut_books_[l.inst] : nullptr;
+      if (!b || !b->valid()) {
+        ++skipped;
+        continue;
+      }
+      px = l.side == Side::Sell ? b->bid() : b->ask();
+    }
+    if (px <= 0) {
+      ++skipped;
+      continue;
+    }
+    // Split into firm-max chunks so the close passes the size cap even when
+    // the position itself has grown past it (riskgate lets reduce-only orders
+    // through the cap; the chunking keeps each request venue-sane too).
+    const Qty cap =
+        in.is_stock() ? cfg_.limits.max_stock_order_qty : cfg_.limits.max_order_qty;
+    Qty left = l.qty;
+    while (left > 0) {
+      const Qty qty = cap > 0 && left > cap ? cap : left;
+      dispatching_strategy_ = l.strategy;
+      dispatching_account_ = l.account;
+      const OrderId id = place(l.inst, l.side, l.offset, px, qty, Tif::Ioc, cur_ts_);
+      dispatching_strategy_ = 0;
+      dispatching_account_ = 0;
+      if (id != kNoOrder) {
+        // place() returns the id before the verdict; a deny for THIS id is
+        // already recorded when it happens (risk runs inside the dispatch).
+        if (last_deny_.cl_id == id && last_deny_.check != RiskCheck{}) ++denied;
+        else ++sent;
+      }
+      left -= qty;
+    }
+  }
+  logf("[site] FLATTEN: %zu leg(s), %zu close order(s) sent, %zu denied by risk, %zu "
+       "skipped (no book/price)\n",
+       legs.size(), sent, denied, skipped);
 }
 
 }  // namespace plat

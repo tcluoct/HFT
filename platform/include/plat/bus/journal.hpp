@@ -4,15 +4,24 @@
 // audit record, the recovery substrate, and the replay/backtest input; one
 // format serves all three so they can never disagree.
 //
-// Durability model for this implementation: buffered writes + explicit
-// flush at seal; production would double-buffer through io_uring/O_DIRECT on
-// a dedicated core. The reader validates magic, count, and the running
-// FNV-1a stream checksum written at seal time.
+// Durability model: buffered writes, flushed to the OS after every drain
+// burst (process crash loses nothing already appended), and pushed to stable
+// storage on a cadence and at seal (`sync()` → fdatasync / _commit). A journal
+// that hit a write error is NEVER sealed: it stays unsealed exactly like a
+// crashed session, so recovery/replay treats it as incomplete instead of
+// certifying a truncated audit record. The reader validates magic, count, and
+// the running FNV-1a stream checksum written at seal time.
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "plat/bus/envelope.hpp"
 #include "plat/core/hash.hpp"
@@ -20,6 +29,7 @@
 namespace plat {
 
 inline constexpr std::uint64_t kJournalMagic = 0x0100'4C4E'524A'4C50ull;  // "PLJRNL" v1
+inline constexpr std::uint16_t kJournalVersion = 1;
 
 struct JournalHeader {
   std::uint64_t magic = 0;
@@ -28,7 +38,8 @@ struct JournalHeader {
   std::uint32_t day = 0;         // yyyymmdd tag
   SiteId site = 0;
   std::uint8_t sealed = 0;
-  std::uint8_t pad_[4066]{};
+  std::uint16_t version = kJournalVersion;  // 0 = pre-versioning (legacy) record
+  std::uint8_t pad_[4064]{};
 };
 static_assert(sizeof(JournalHeader) == 4096);
 
@@ -48,35 +59,86 @@ class JournalWriter {
     hdr_.magic = kJournalMagic;
     hdr_.day = day;
     hdr_.site = site;
-    return std::fwrite(&hdr_, sizeof(hdr_), 1, f_) == 1;
+    hdr_.version = kJournalVersion;
+    hash_ = StateHash{};
+    error_ = false;
+    if (std::fwrite(&hdr_, sizeof(hdr_), 1, f_) != 1) {
+      error_ = true;
+      std::fclose(f_);
+      f_ = nullptr;
+      return false;
+    }
+    return true;
   }
 
-  void append(const Envelope& e) {
-    if (!f_) return;
+  // Appends one envelope. False means the audit record is broken from here on
+  // (write error / closed journal): the caller must stop trading, and this
+  // writer will refuse to seal (an incomplete record must not look complete).
+  bool append(const Envelope& e) {
+    if (!f_ || error_) return false;
+    if (std::fwrite(&e, sizeof(e), 1, f_) != 1) {
+      error_ = true;
+      return false;
+    }
     hash_.mix(e.seq);
     hash_.mix(e.schema);
     hash_.mix_bytes(e.payload, e.size);
     ++hdr_.count;
-    std::fwrite(&e, sizeof(e), 1, f_);
+    return true;
   }
 
-  // Crash durability: push buffered envelopes to the OS so a process crash
-  // loses nothing already appended (the async journal thread calls this
+  // Process-crash durability: push buffered envelopes to the OS so a process
+  // crash loses nothing already appended (the async journal thread calls this
   // after each drain burst — never the engine).
-  void flush() {
-    if (f_) std::fflush(f_);
+  bool flush() {
+    if (!f_ || error_) return false;
+    if (std::fflush(f_) != 0) {
+      error_ = true;
+      return false;
+    }
+    return true;
   }
 
-  // Seal: finalize count + checksum in the header. Idempotent.
+  // Machine-crash durability: push the OS cache to stable storage. Called on
+  // the journal thread's cadence and at seal — never on the engine thread.
+  bool sync() {
+    if (!flush()) return false;
+    if (!sync_fd()) {
+      error_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  // Seal: finalize count + checksum in the header, sync it, and only then
+  // report success. A faulted writer refuses: the file stays unsealed so
+  // readers treat it as an incomplete (crashed) session.
   bool seal() {
-    if (!f_) return false;
+    if (!f_ || error_) return false;
     hdr_.stream_hash = hash_.value();
     hdr_.sealed = 1;
-    if (std::fseek(f_, 0, SEEK_SET) != 0) return false;
-    const bool ok = std::fwrite(&hdr_, sizeof(hdr_), 1, f_) == 1;
-    std::fflush(f_);
+    const JournalHeader out = hdr_;
+    if (std::fseek(f_, 0, SEEK_SET) != 0 ||
+        std::fwrite(&out, sizeof(out), 1, f_) != 1) {
+      hdr_.sealed = 0;
+      error_ = true;
+      return false;
+    }
+    if (!sync()) {
+      hdr_.sealed = 0;
+      return false;
+    }
     std::fseek(f_, 0, SEEK_END);
-    return ok;
+    return true;
+  }
+
+  // Close WITHOUT sealing: the faulted-journal path. The file is left
+  // unsealed exactly like a crashed session, never certified as complete.
+  void abandon() {
+    if (!f_) return;
+    std::fflush(f_);
+    std::fclose(f_);
+    f_ = nullptr;
   }
 
   void close() {
@@ -87,13 +149,23 @@ class JournalWriter {
     }
   }
 
+  [[nodiscard]] bool healthy() const noexcept { return !error_; }
   [[nodiscard]] std::uint64_t count() const noexcept { return hdr_.count; }
   [[nodiscard]] std::uint64_t stream_hash() const noexcept { return hash_.value(); }
 
  private:
+  bool sync_fd() {
+#ifdef _WIN32
+    return ::_commit(::_fileno(f_)) == 0;
+#else
+    return ::fdatasync(::fileno(f_)) == 0;
+#endif
+  }
+
   std::FILE* f_ = nullptr;
   JournalHeader hdr_{};
   StateHash hash_;
+  bool error_ = false;
 };
 
 class JournalReader {
@@ -125,19 +197,33 @@ class JournalReader {
     if (!f) return false;
     JournalHeader hdr{};
     bool ok = std::fread(&hdr, sizeof(hdr), 1, f) == 1 && hdr.magic == kJournalMagic;
+    // 0 is a pre-versioning record (written by an older build); a future
+    // version is refused rather than misread with today's message layouts.
+    if (ok && hdr.version > kJournalVersion) ok = false;
+    // Count from the file itself, not from a possibly corrupt header: a
+    // sealed file's count must match its size, an unsealed one IS its size
+    // (whole records only; a torn tail is dropped).
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    const std::uint64_t max_records =
+        size > static_cast<long>(sizeof(JournalHeader))
+            ? (static_cast<std::uint64_t>(size) - sizeof(JournalHeader)) / sizeof(Envelope)
+            : 0;
     std::uint64_t count = hdr.count;
-    if (ok && !hdr.sealed) {
-      std::fseek(f, 0, SEEK_END);
-      const long size = std::ftell(f);
-      std::fseek(f, sizeof(JournalHeader), SEEK_SET);
-      count = size > static_cast<long>(sizeof(JournalHeader))
-                  ? (static_cast<std::uint64_t>(size) - sizeof(JournalHeader)) / sizeof(Envelope)
-                  : 0;  // whole records only: a torn tail is dropped
+    if (ok && hdr.sealed) {
+      if (count > max_records) ok = false;  // corrupt/truncated sealed header
+    } else if (ok) {
+      count = max_records;
     }
     if (ok) {
+      std::fseek(f, sizeof(JournalHeader), SEEK_SET);
       envelopes_.resize(count);
       ok = count == 0 ||
            std::fread(envelopes_.data(), sizeof(Envelope), count, f) == count;
+      for (const Envelope& e : envelopes_) {
+        if (!ok) break;
+        if (e.size == 0 || e.size > kMaxPayload) ok = false;  // torn/garbage record
+      }
     }
     std::fclose(f);
     if (!ok) {

@@ -4,6 +4,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 #include "plat/core/log.hpp"
 #include "platd_app.hpp"
@@ -40,9 +42,47 @@ PhaseSchedule schedule_from(const Config& c) {
   return s.count ? s : futures_schedule();
 }
 
+bool is_trading_day(const std::string& path, std::uint32_t day) {
+  std::ifstream f(path);
+  if (!f) {
+    logf("[platd] trade_calendar `%s` cannot be opened — refusing to guess\n", path.c_str());
+    return false;
+  }
+  std::string line;
+  bool listed = false;
+  while (std::getline(f, line)) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    const auto b = line.find_first_not_of(" \t\r");
+    if (b == std::string::npos) continue;
+    const auto e = line.find_last_not_of(" \t\r");
+    line = line.substr(b, e - b + 1);
+    const auto dash = line.find('-');
+    const std::string lhs = line.substr(0, dash);
+    const std::string rhs = dash == std::string::npos ? lhs : line.substr(dash + 1);
+    std::uint32_t lo = 0, hi = 0;
+    if (lhs.size() != 8 || rhs.size() != 8) {
+      logf("[platd] trade_calendar: expected yyyymmdd or yyyymmdd-yyyymmdd, got `%s`\n",
+           line.c_str());
+      continue;
+    }
+    try {
+      lo = static_cast<std::uint32_t>(std::stoul(lhs));
+      hi = static_cast<std::uint32_t>(std::stoul(rhs));
+    } catch (...) {
+      logf("[platd] trade_calendar: ignoring malformed line `%s`\n", line.c_str());
+      continue;
+    }
+    if (day >= lo && day <= hi) listed = true;
+  }
+  if (!listed)
+    logf("[platd] %u is NOT a trading day per %s — refusing to start\n", day, path.c_str());
+  return listed;
+}
+
 bool require_keys(const Config& c) {
   static constexpr const char* kRequired[] = {
-      "td_front", "md_front", "broker_id", "user_id", "password", "instruments"};
+      "td_front", "md_front", "broker_id", "user_id", "instruments"};
   bool ok = true;
   for (const char* k : kRequired) {
     // Present-but-EMPTY must fail too: the CTP api does not survive an empty
@@ -52,6 +92,12 @@ bool require_keys(const Config& c) {
       logf("config: missing required key `%s`\n", k);
       ok = false;
     }
+  }
+  // Credentials may come from the environment or a permissioned file; accept
+  // any of `password`, `password_env`, `password_file`.
+  if (resolve_secret(c, "password").empty()) {
+    logf("config: missing `password` (or password_env/password_file)\n");
+    ok = false;
   }
   return ok;
 }

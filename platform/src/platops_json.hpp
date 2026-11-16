@@ -13,6 +13,40 @@
 
 namespace platops {
 
+// Prometheus text exposition (GET /metrics): one gauge per shard for the
+// health signals an external monitor needs — mirror freshness, audit volume,
+// fills, and per-strategy realized PnL. Read-only, same data as the web page.
+inline std::string prometheus_metrics(const std::vector<std::unique_ptr<MirrorShard>>& shards,
+                                      Nanos now) {
+  std::string out;
+  const auto add = [&out](const char* name, const std::string& shard, double v) {
+    out += name;
+    out += "{shard=\"";
+    out += shard;
+    out += "\"} ";
+    out += std::to_string(v);
+    out += '\n';
+  };
+  out += "platops_up 1\n";
+  for (const auto& sh : shards) {
+    const std::string& n = sh->name();
+    MirrorSite* site = sh->site();
+    add("platops_shard_envelopes", n, static_cast<double>(sh->envelopes()));
+    add("platops_shard_fills_total", n,
+        site ? static_cast<double>(site->tel().get("fills")) : 0.0);
+    if (sh->last_md_ts() > 0)
+      add("platops_shard_md_age_seconds", n,
+          static_cast<double>(now - sh->last_md_ts()) / 1e9);
+    else
+      add("platops_shard_md_age_seconds", n, -1.0);  // no market data yet
+    if (site)
+      for (const auto& s : sh->specs())
+        add("platops_shard_realized_cny", n + "/" + s.name,
+            px_to_cny(site->pnl().total_realized_e4(s.id)));
+  }
+  return out;
+}
+
 inline const char* risk_check_name(RiskCheck c) {
   switch (c) {
     case RiskCheck::PhaseGate: return "PhaseGate";

@@ -49,6 +49,7 @@ enum class Schema : std::uint16_t {
   ManualOrder,
   ManualCancel,
   PositionTransfer,
+  RiskLimits,
 };
 
 // ---------------------------------------------------------------- market data

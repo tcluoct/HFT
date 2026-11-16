@@ -197,9 +197,18 @@ static void test_strategy_config() {
   std::remove(path);
 }
 
+// The desk's pack identity is part of a journal's recovery contract: it must
+// be stable, nonzero, and include the bank order/names (a different lineup
+// changes the compiled deterministic state).
+static void test_pack_fingerprint() {
+  CHECK(Pack::fingerprint() != 0);
+  CHECK(Pack::fingerprint() == Pack::fingerprint());
+}
+
 int main() {
   test_three_strategies();
   test_strategy_config();
+  test_pack_fingerprint();
   std::printf("desk_tests: %d checks, %d failures\n", g_checks, g_fails);
   return g_fails == 0 ? 0 : 1;
 }

@@ -495,6 +495,12 @@ is a plugin on it.
   - Journal-writer or journal-volume failure is a fail-closed site fault: halt new
     orders, keep cancels available, alarm. Fault injection covers every one of these
     boundaries, including failure between SDK handoff and journal durability (§16).
+  - **Phase-1 implementation:** the writer is an async thread on a 1 MiB buffered
+    stream; every drain burst is `fflush`ed to the OS (process-crash durable) and
+    `journal.sync_ms` fsyncs to stable storage (machine-crash window), with a final
+    fsync at seal. A write error leaves the file **unsealed** — a truncated record is
+    never certified complete. The header carries a schema version; the durable
+    watermark / io_uring variant above remains the production target.
 
 ### 7.3 Cross-site bridge (`bridged`)
 
@@ -828,6 +834,15 @@ Denials are messages on the bus (audit + strategy feedback), never silent.
   by: any engineer (2-person confirm for firm-global flatten), automated monitors
   (position breaks, loss limits, connectivity loss, data-integrity alarms, ring/
   journal fail-closed faults), and physically from HQ and each site.
+- **Phase-1 implementation**: FLATTEN is a distinct reduce-only kill mode, not
+  the same flag as HALT. It cancels the scope's resting orders, waits for them
+  to terminate (so the close cannot wash against our own book), then closes
+  every position bucket with IOC orders at the touch, split to the firm's max
+  order size; opening stays refused until `disarm`. Riskgate lets reduce-only
+  orders through the kill gate and throttles during a flatten, and never an
+  order that adds risk. Progress/outcome are logged and journaled; the richer
+  bounded-aggression workflow above (pacing, abort, progress acknowledgment)
+  remains the target.
 - Drilled monthly (§16).
 
 ### 10.4 Audit
@@ -846,7 +861,22 @@ Every stateful component = `snapshot + replay(canonical stream since snapshot)`.
 Components snapshot to shm/NVMe every N seconds. Restart: load snapshot, replay from
 journal, rejoin live stream — target **< 5 s** to live for any single component.
 
+**Phase-1 implementation:** the site writes a checksummed snapshot (state + canonical
+envelope index) every `journal.snapshot_sec` to `<journal>.snap`, bound to a
+`<journal>.session` fingerprint (build + desk pack + effective config + day/site).
+Resume copies the journal prefix into the new journal without dispatch, loads the
+snapshot, and dispatches only the Source suffix; a missing/torn/mismatched snapshot
+falls back to a full replay, which is the correctness floor. The journal remains the
+complete record; the snapshot only shortens recovery.
+
 ### 11.2 Warm standby
+
+**Phase-1 status:** the snapshot + journal `recover` path is implemented and tested,
+but the live warm-standby process is **not wired**: the broadcast ring is in-process
+memory, so a second host cannot tail it without the shared-memory transport this
+design assumes. Until then, takeover is "restart the process; resume from
+snapshot/journal; reconcile against the counter; operator re-arms" — the same
+procedure below, without an already-warm process.
 
 - The standby trading server consumes the same multicast feeds and mirrors the
   journal stream (tail-follow over the site LAN), holding warm state minutes-fresh.

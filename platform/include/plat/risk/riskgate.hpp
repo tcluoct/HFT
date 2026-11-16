@@ -62,6 +62,19 @@ class RiskGate {
   void attach_fut_book(InstrumentId i, const FutBook* b) { fut_books_[i] = b; }
 
   void set_phase(Venue v, Phase p) { phase_[static_cast<std::size_t>(v)] = p; }
+  // Live risk-limit update (operator `reload`), applied on the engine thread
+  // from a journaled Source RiskLimitsEvt. Rate-ring capacity is fixed at
+  // construction, so changing max_actions_per_sec needs a restart; everything
+  // else applies immediately. Returns false and leaves the gate unchanged on
+  // a rejected update.
+  bool set_limits(const RiskLimits& l) {
+    if (l.max_order_qty <= 0 || l.max_actions_per_sec == 0 ||
+        l.max_actions_per_sec != limits_.max_actions_per_sec)
+      return false;  // invalid, or rate-ring resize (restart-only)
+    limits_ = l;
+    return true;
+  }
+  [[nodiscard]] const RiskLimits& limits() const noexcept { return limits_; }
   [[nodiscard]] KillSwitch& kill() noexcept { return kill_; }
   [[nodiscard]] const KillSwitch& kill() const noexcept { return kill_; }
   // Cold-path only (console/ops use): the price the collar check (§10.1 #2)
@@ -75,11 +88,22 @@ class RiskGate {
   // The engine publishes RiskDeny on failure and forwards on pass.
   [[nodiscard]] RiskCheck check_new(const NewOrderReq& r, Nanos now) {
     const Instrument& in = table_->at(r.inst);
+    const bool stock = in.is_stock();
+    // Reduce-only by construction: futures closes carry a close offset, stock
+    // sells draw down the T+1 sellable ledger (never a short).
+    const bool reduce_only = stock ? r.side == Side::Sell : r.offset != Offset::Open;
 
-    // 12) Kill switch first — cheapest and overrides everything.
-    if (kill_.halted(r.account, r.strategy)) [[unlikely]] return RiskCheck::KillSwitch;
+    // 12) Kill switch. HALT refuses everything; FLATTEN is reduce-only mode:
+    // it refuses orders that add risk but lets the emergency close-out
+    // through — a kill switch that cannot close a book is not a kill switch.
+    const KillMode kill_mode = kill_.mode(r.account, r.strategy);
+    const bool emergency_close = kill_mode == KillMode::Flatten && reduce_only;
+    if (kill_mode == KillMode::Halt || (kill_mode == KillMode::Flatten && !reduce_only))
+      return RiskCheck::KillSwitch;
 
-    // 1) Phase gate.
+    // 1) Phase gate. An emergency close still needs a phase that accepts
+    // orders (continuous or an auction); a closed venue cannot be flattened
+    // with limit orders, and pretending otherwise would hide the exposure.
     if (!phase_accepts_orders(phase_[static_cast<std::size_t>(in.venue)]))
       return RiskCheck::PhaseGate;
 
@@ -96,15 +120,23 @@ class RiskGate {
       if (r.px > ref + band || r.px < ref - band) return RiskCheck::PriceCollar;
     }
 
-    // 3) Size / notional caps.
-    if (r.qty <= 0 ||
-        r.qty > (in.is_stock() ? limits_.max_stock_order_qty : limits_.max_order_qty))
-      return RiskCheck::SizeNotional;
-    if (notional_e4(in, r.px, r.qty) > limits_.max_order_notional_e4)
-      return RiskCheck::SizeNotional;
+    // 3) Size / notional caps. An emergency close is exempt from the FIRM
+    //    caps — the position may honestly exceed them after a price move —
+    //    but not from `qty > 0`; Site splits the close into chunks of at most
+    //    the configured maximum so no single order is oversized.
+    if (r.qty <= 0) return RiskCheck::SizeNotional;
+    if (!emergency_close) {
+      if (r.qty > (stock ? limits_.max_stock_order_qty : limits_.max_order_qty))
+        return RiskCheck::SizeNotional;
+      if (notional_e4(in, r.px, r.qty) > limits_.max_order_notional_e4)
+        return RiskCheck::SizeNotional;
+    }
 
     // 4) Position / exposure cap per strategy (net + this order's add).
-    if (exposure_after(r) > limits_.max_net_notional_e4) return RiskCheck::Exposure;
+    //    A reduce-only close cannot increase exposure, and blocking it on the
+    //    current (possibly over-cap) mark is exactly when it matters most.
+    if (!emergency_close && exposure_after(r) > limits_.max_net_notional_e4)
+      return RiskCheck::Exposure;
 
     // 5) Sellable inventory (stocks, T+1): sells draw down carry-in minus
     //    today's sells minus open sell orders already working.
@@ -149,20 +181,34 @@ class RiskGate {
     }
 
     // 7) Rate token bucket per account (order actions = news + cancels).
+    //    An emergency close bypasses the throttles for the same reason the
+    //    cancel path does under halt: a book that cannot be closed because
+    //    the runaway already burned the budget is the failure mode the kill
+    //    switch exists to prevent. The action is still counted.
     Counters& c = counters_for(r.account);
-    if (!rate_ok(c, now)) return RiskCheck::RateLimit;
+    if (!emergency_close) {
+      if (!rate_ok(c, now)) return RiskCheck::RateLimit;
+    } else {
+      prune(c, now);
+      if (c.count == c.ring.size()) c.pop_front();  // keep the ring bounded
+    }
 
     // 8) Cancel-ratio guard is a cancel-side check; news pass through.
 
     // 9) Self-trade prevention: would this cross our own resting order?
+    //    Kept even for an emergency close — washing against our own resting
+    //    order is what the venue rejects; the halt's cancels clear them first.
     if (crosses_own(r)) return RiskCheck::SelfTrade;
 
     // 10) Duplicate/burst breaker: identical order repeated inside the
-    //     repeat-fire horizon.
-    if (dup_.is_duplicate(r, now)) return RiskCheck::DuplicateBurst;
+    //     repeat-fire horizon. Skipped for the close-out: one position is
+    //     closed per bucket at the same touch price, which looks identical.
+    if (!emergency_close) {
+      if (dup_.is_duplicate(r, now)) return RiskCheck::DuplicateBurst;
+      dup_.remember(r, now);
+    }
 
     note_action(c, now, /*cancel=*/false);
-    dup_.remember(r, now);
     return kRiskPass;
   }
 
@@ -218,6 +264,7 @@ class RiskGate {
       for (std::uint32_t k = 0; k < c.count; ++k) h.mix(c.at(k));
     }
     dup_.mix_into(h);
+    mix_limits(h, limits_);
     return h.value();
   }
 
@@ -243,6 +290,34 @@ class RiskGate {
     const auto app = [](std::vector<std::uint8_t>& o, const auto& v) { append(o, v); };
     dup_.save(out, app);
     guard_.save(out, app);
+    // Hot-reloaded risk limits are part of recovery state: a snapshot taken
+    // after `reload` must not silently revert to the startup config limits.
+    append(out, limits_.max_order_qty);
+    append(out, limits_.max_stock_order_qty);
+    append(out, limits_.max_order_notional_e4);
+    append(out, limits_.max_net_notional_e4);
+    append(out, limits_.max_margin_e4);
+    append(out, limits_.max_actions_per_sec);
+    append(out, limits_.max_actions_per_day);
+    append(out, limits_.cancel_ratio_pct);
+    append(out, limits_.cancel_ratio_min_actions);
+    append(out, limits_.price_collar_ticks);
+    append(out, limits_.max_book_age);
+    append(out, limits_.duplicate_window);
+    append(out, limits_.duplicate_horizon);
+    append(out, limits_.check_close_position);
+    append(out, limits_.max_strategy_loss_e4);
+    append(out, limits_.max_account_loss_e4);
+    append(out, limits_.max_inst_open_qty);
+    append(out, limits_.max_inst_cancels);
+    append(out, limits_.check_cancel_target);
+    append(out, limits_.cancel_retry_after);
+    append(out, limits_.stock_cage_bps);
+    append(out, limits_.stock_cage_ticks);
+    append(out, limits_.stock_cage_etf);
+    append(out, limits_.st_daily_buy_qty);
+    append(out, limits_.max_stock_holding_qty);
+    append(out, limits_.max_stock_holding_e4);
   }
   std::size_t load(const std::uint8_t* p, std::size_t avail) {
     counters_.clear();
@@ -268,7 +343,33 @@ class RiskGate {
       }
     }
     off = dup_.load(p, off, avail, rd);
-    return guard_.load(p, off, avail, rd);
+    off = guard_.load(p, off, avail, rd);
+    off = read(p, off, avail, limits_.max_order_qty);
+    off = read(p, off, avail, limits_.max_stock_order_qty);
+    off = read(p, off, avail, limits_.max_order_notional_e4);
+    off = read(p, off, avail, limits_.max_net_notional_e4);
+    off = read(p, off, avail, limits_.max_margin_e4);
+    off = read(p, off, avail, limits_.max_actions_per_sec);
+    off = read(p, off, avail, limits_.max_actions_per_day);
+    off = read(p, off, avail, limits_.cancel_ratio_pct);
+    off = read(p, off, avail, limits_.cancel_ratio_min_actions);
+    off = read(p, off, avail, limits_.price_collar_ticks);
+    off = read(p, off, avail, limits_.max_book_age);
+    off = read(p, off, avail, limits_.duplicate_window);
+    off = read(p, off, avail, limits_.duplicate_horizon);
+    off = read(p, off, avail, limits_.check_close_position);
+    off = read(p, off, avail, limits_.max_strategy_loss_e4);
+    off = read(p, off, avail, limits_.max_account_loss_e4);
+    off = read(p, off, avail, limits_.max_inst_open_qty);
+    off = read(p, off, avail, limits_.max_inst_cancels);
+    off = read(p, off, avail, limits_.check_cancel_target);
+    off = read(p, off, avail, limits_.cancel_retry_after);
+    off = read(p, off, avail, limits_.stock_cage_bps);
+    off = read(p, off, avail, limits_.stock_cage_ticks);
+    off = read(p, off, avail, limits_.stock_cage_etf);
+    off = read(p, off, avail, limits_.st_daily_buy_qty);
+    off = read(p, off, avail, limits_.max_stock_holding_qty);
+    return read(p, off, avail, limits_.max_stock_holding_e4);
   }
 
  private:
@@ -448,6 +549,11 @@ class RiskGate {
     bool crossed = false;
     oms_->for_each_open(r.inst, [&](const OmsOrder& o) {
       if (crossed || o.account != r.account || o.side == r.side || o.cl_id == r.cl_id) return;
+      // An IOC never rests: once the venue processes it, it is filled or
+      // cancelled, so it cannot be the counterparty of a later order. The
+      // emergency close-out sweeps IOC aggressors at opposite touches; treating
+      // its own earlier legs as resting liquidity would deadlock the sweep.
+      if (o.tif == Tif::Ioc) return;
       crossed = r.side == Side::Buy ? r.px >= o.px : r.px <= o.px;
     });
     return crossed;

@@ -84,6 +84,14 @@ build\vs2026\strategies\<team>\Release\strat_<team>_tests.exe   # team suite
 build\vs2026\desk\Release\desk_tests.exe              # desk/lineup suite
 ```
 
+One-command QA gate (configure + full build + every suite + `platd --check`):
+
+```pwsh
+pwsh -File tools/run-qa.ps1              # -SkipConfigure / -SkipBuild for incremental runs
+```
+
+CI runs the same checks on Windows (`.github/workflows/ci.yml`).
+
 Each project also configures standalone — run the same two commands inside
 its directory; it pulls in `common/` and the shared build config itself.
 

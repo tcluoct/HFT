@@ -31,6 +31,7 @@
 #include "plat/bus/journal.hpp"
 #include "plat/bus/ring.hpp"
 #include "plat/core/thread.hpp"
+#include "plat/core/time.hpp"
 #include "plat/tel/telemetry.hpp"
 
 namespace plat {
@@ -43,9 +44,13 @@ class AsyncJournal {
   ~AsyncJournal() { finish(); }
 
   // Opens the journal file and starts the writer thread (pinned to
-  // `writer_core` when ≥ 0).
-  bool open(const std::string& path, std::uint32_t day, SiteId site, int writer_core = -1) {
+  // `writer_core` when ≥ 0). `sync_interval` is the stable-storage cadence:
+  // every drain burst reaches the OS (process-crash durable); `sync()` pushes
+  // it to disk at most that often and at seal (machine-crash durable).
+  bool open(const std::string& path, std::uint32_t day, SiteId site, int writer_core = -1,
+            Nanos sync_interval = 100 * kNsPerMs) {
     if (!jw_.open(path, day, site)) return false;
+    sync_interval_ = sync_interval;
     ring_ = std::make_unique<Ring>(kSlots);
     writer_.emplace(*ring_);
     stop_.store(false, std::memory_order_relaxed);
@@ -73,13 +78,19 @@ class AsyncJournal {
     return result;
   }
 
-  // False once the writer thread was lapped (audit hole) — fail closed.
+  // False once the writer thread was lapped or hit a write error (audit hole)
+  // — fail closed.
   [[nodiscard]] bool healthy() const noexcept {
     return !fault_.load(std::memory_order_acquire);
   }
   [[nodiscard]] bool is_open() const noexcept { return open_; }
+  // Test-only: force the fault path so a suite can prove a faulted journal is
+  // left UNSEALED (an incomplete record must never look complete).
+  void simulate_fault_for_test() noexcept { fault_.store(true, std::memory_order_release); }
 
-  // Drain everything still in flight, seal the header, join. Idempotent.
+  // Drain everything still in flight, then seal. A journal that faulted is
+  // abandoned unsealed: recovery/replay must see it as incomplete, never as a
+  // certified day. Idempotent.
   void finish() {
     if (thread_.joinable()) {
       stop_.store(true, std::memory_order_release);
@@ -88,7 +99,11 @@ class AsyncJournal {
         std::lock_guard lock(timing_mutex_);
         published_timing_ = worker_timing_; // final snapshot after join
       }
-      jw_.close();  // seals (count + running hash) and closes
+      if (fault_.load(std::memory_order_acquire)) {
+        jw_.abandon();  // leave the header unsealed; keep the bytes for post-mortem
+      } else {
+        jw_.close();  // seals (count + running hash) and syncs
+      }
     }
     open_ = false;
   }
@@ -102,8 +117,10 @@ class AsyncJournal {
     Ring::Reader reader(*ring_, /*from_origin=*/true, Ring::LossPolicy::Intolerant);
     Envelope e;
     bool dirty = false;  // appended since the last flush
+    bool unsynced = false;  // appended since the last fsync
     Nanos batch_begin = 0, batch_end = 0;
     std::uint64_t messages = 0;
+    Nanos last_sync = perf_now_ns();
     for (;;) {
       Nanos enqueued = 0;
       const auto p = reader.poll(e, &enqueued);
@@ -112,9 +129,13 @@ class AsyncJournal {
           const auto begin = enqueued ? perf_now_ns() : 0;
           if (enqueued && begin >= enqueued) worker_timing_.queue.record(begin - enqueued);
           if (enqueued && !batch_begin) batch_begin = begin;
-          jw_.append(e);
+          if (!jw_.append(e)) {  // write error: the audit record is broken
+            fault_.store(true, std::memory_order_release);
+            return;
+          }
           if (enqueued) batch_end = perf_now_ns();
           dirty = true;
+          unsynced = true;
           if (++messages % 256 == 0) publish_timing();
           continue;
         }  // drain the batch before sleeping
@@ -130,7 +151,10 @@ class AsyncJournal {
         // process crash then loses nothing that was ever appended (§11.2,
         // what --resume replays). Costs a syscall per burst, on this thread.
         const auto flush_begin = batch_begin ? perf_now_ns() : 0;
-        jw_.flush();
+        if (!jw_.flush()) {
+          fault_.store(true, std::memory_order_release);
+          return;
+        }
         if (batch_begin) {
           worker_timing_.write_batch.record(batch_end - batch_begin);
           worker_timing_.flush.record(perf_now_ns() - flush_begin);
@@ -138,6 +162,18 @@ class AsyncJournal {
         }
         publish_timing();
         dirty = false;
+      }
+      // Machine-crash durability on a cadence (and at seal): the engine's
+      // per-envelope cost stays one ring publish; this thread pays the fsync.
+      // Only when something was appended — an idle journal does not fsync.
+      const Nanos now = perf_now_ns();
+      if (sync_interval_ > 0 && unsynced && now - last_sync >= sync_interval_) {
+        if (!jw_.sync()) {
+          fault_.store(true, std::memory_order_release);
+          return;
+        }
+        last_sync = now;
+        unsynced = false;
       }
       if (stop_.load(std::memory_order_acquire)) return;  // drained + stopping
       // Journal latency is not tick latency: sleep, don't burn a core.
@@ -168,6 +204,7 @@ class AsyncJournal {
   std::thread thread_;
   std::atomic<bool> stop_{false};
   std::atomic<bool> fault_{false};
+  Nanos sync_interval_ = 100 * kNsPerMs;  // engine-visible; set before start
   bool open_ = false;
 };
 

@@ -44,7 +44,7 @@ int main(int argc, char** argv) {
     const bool resume = argc >= 5 && std::strcmp(argv[4], "--resume") == 0;
     plat::logf("[platd] running as shard %d of %s%s\n", n, argv[3],
                resume ? " (FORCED RESUME)" : "");
-    return run_live(shard_config(fleet, n), resume);
+    return run_live(shard_config(fleet, n), resume, argv[3], n);
   }
   if (argc >= 3 && std::strcmp(argv[1], "--dump") == 0) {
     return plat::dump_journal(argv[2], argc >= 4 ? std::strtoull(argv[3], nullptr, 10) : 0);
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     plat::Config cfg;
     if (!load_or_die(cfg, argv[1])) return 1;
     const bool resume = argc >= 3 && std::strcmp(argv[2], "--resume") == 0;
-    return run_live(cfg, resume);
+    return run_live(cfg, resume, argv[1], 0);
   }
   plat::logf(
       "usage:\n"

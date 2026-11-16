@@ -44,11 +44,13 @@ struct HttpRequest {
   std::string method;
   std::string path;
   std::string body;
+  std::string authorization;  // raw Authorization header (Basic auth)
 };
 
 struct HttpResponse {
   int status = 200;
   std::string content_type = "text/plain; charset=utf-8";
+  std::string extra_headers;  // raw lines, each ending in CRLF (e.g. WWW-Authenticate)
   std::string body;
 };
 
@@ -140,13 +142,15 @@ class HttpServer {
       body.append(buf, static_cast<std::size_t>(n));
     }
     req.body = std::move(body);
+    req.authorization = header_value(in.substr(0, hdr_end), "authorization:");
 
-    const HttpResponse res = handler_ ? handler_(req) : HttpResponse{404, "text/plain", ""};
+    const HttpResponse res = handler_ ? handler_(req) : HttpResponse{404, "text/plain", "", ""};
     std::string out = "HTTP/1.1 " + std::to_string(res.status) +
                       (res.status == 200 ? " OK" : " ERR") +
                       "\r\nContent-Type: " + res.content_type +
                       "\r\nContent-Length: " + std::to_string(res.body.size()) +
-                      "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + res.body;
+                      "\r\n" + res.extra_headers +
+                      "Cache-Control: no-store\r\nConnection: close\r\n\r\n" + res.body;
     std::size_t sent = 0;
     while (sent < out.size()) {
       const int n = ::send(c, out.data() + sent, static_cast<int>(out.size() - sent), 0);
@@ -163,6 +167,20 @@ class HttpServer {
       }
     }
     return 0;
+  }
+  // Case-insensitive header value lookup; `name` includes the trailing ':'.
+  static std::string header_value(const std::string& head, const char* name) {
+    const std::size_t n = std::strlen(name);
+    for (std::size_t i = 0; i + n <= head.size(); ++i) {
+      if (i != 0 && head[i - 1] != '\n') continue;  // only at a line start
+      if (_strnicmp_portable(head.c_str() + i, name, n) != 0) continue;
+      std::size_t v = i + n;
+      while (v < head.size() && (head[v] == ' ' || head[v] == '\t')) ++v;
+      std::size_t e = head.find("\r\n", v);
+      if (e == std::string::npos) e = head.size();
+      return head.substr(v, e - v);
+    }
+    return {};
   }
   static int _strnicmp_portable(const char* a, const char* b, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) {

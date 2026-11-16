@@ -39,8 +39,10 @@
 #include "plat/core/phase.hpp"
 #include "plat/core/thread.hpp"
 #include "plat/core/types.hpp"
+#include "plat/engine/fingerprint.hpp"
 #include "plat/engine/ops_cmds.hpp"
 #include "plat/engine/site.hpp"
+#include "plat/engine/snapshot.hpp"
 
 namespace plat {
 
@@ -179,6 +181,7 @@ class LiveDriver {
       did_work |= fire_phases(now);
       did_work |= fire_timers(now);
       did_work |= process_console(now);
+      maybe_snapshot(now);
 
       if (!site_->journal_healthy() && !journal_faulted_) {
         // Audit hole (journal thread lapped): we do not trade without a
@@ -211,6 +214,23 @@ class LiveDriver {
   void set_eod_query(EodQueryFn fn, void* ctx) {
     eod_fn_ = fn;
     eod_ctx_ = ctx;
+  }
+
+  // Live risk-limit reload (`reload`): main owns the config path/shard overlay,
+  // so it supplies a loader; the driver turns the result into a journaled
+  // Source RiskLimitsEvt (replay re-applies it deterministically).
+  using LimitsLoaderFn = bool (*)(void* ctx, RiskLimits& out);
+  void set_limits_loader(LimitsLoaderFn fn, void* ctx) {
+    limits_fn_ = fn;
+    limits_ctx_ = ctx;
+  }
+
+  // Periodic checkpoint (§11.2): a recovery accelerator, never a substitute
+  // for the journal. `interval <= 0` disables it.
+  void set_snapshot(std::string path, Nanos interval, SessionFingerprint fp) {
+    snap_path_ = std::move(path);
+    snap_interval_ = interval;
+    snap_fp_ = fp;
   }
 
  private:
@@ -259,7 +279,25 @@ class LiveDriver {
         break;
       }
       if (e.is<ExecReport>()) site_->source(e.as<ExecReport>(), e.ts, received);
-      else if (e.is<SessionStateEvt>()) site_->source(e.as<SessionStateEvt>(), e.ts, received);
+      else if (e.is<SessionStateEvt>()) {
+        const auto st = e.as<SessionStateEvt>().state;
+        site_->source(e.as<SessionStateEvt>(), e.ts, received);
+        // Session loss is a trading emergency, not a transient: halt and stay
+        // halted until an operator has reviewed the venue state and re-arms.
+        // A reconnect is *not* proof that working orders and fills are
+        // consistent — automatic reconcile-on-reconnect needs venue trade ids
+        // (DEPLOYMENT.md lists it as the follow-up); silently continuing on a
+        // QUICK private topic can leave OMS/PnL drifting until EOD.
+        if ((st == SessState::Down || st == SessState::Reconciling) && !session_lost_) {
+          session_lost_ = true;
+          logf("[drv] SESSION LOST (state %d) — halting the site; review positions/orders "
+               "against the counter, then `disarm` + `arm`\n",
+               static_cast<int>(st));
+          site_->command_kill(KillScope::Site, KillAction::Halt, 0, live_now_ns());
+        } else if (st == SessState::Up) {
+          session_lost_ = false;  // armed again by the operator; a new loss re-halts
+        }
+      }
       any = true;
     }
     return any;
@@ -345,6 +383,23 @@ class LiveDriver {
       site_->command_kill(scope, KillAction::Disarm, target, now);
       if (scoped) logf("[ops] strategy %u disarmed — trading again\n", target);
       else logf("[ops] kill switch disarmed\n");
+    } else if (verb == "reload") {
+      if (!limits_fn_) {
+        logf("[ops] reload: no config loader wired into this driver\n");
+      } else {
+        RiskLimits next{};
+        if (!limits_fn_(limits_ctx_, next)) {
+          logf("[ops] reload: cannot read the config file — limits unchanged\n");
+        } else {
+          RiskLimitsEvt ev{};
+          ev.ts = now;
+          ev.version = ++limits_version_;
+          ev.limits = next;
+          site_->source(ev, now);  // journaled Source; dispatch applies/logs
+          logf("[ops] reload: risk limits update v%llu queued\n",
+               static_cast<unsigned long long>(ev.version));
+        }
+      }
     } else if (line == "arm") {
       const bool ok = site_->arm_session(now);
       logf("[ops] arm: pre-flight %s\n", ok ? "PASS" : "FAIL");
@@ -394,7 +449,7 @@ class LiveDriver {
       // each is a journaled Source envelope, so it replays and audits.
     } else if (!line.empty()) {
       logf("[ops] commands: halt [strat_id] | flatten [strat_id] | disarm [strat_id] | "
-           "arm | status | quit | param <id> <key> <val> | order <id> <sym> buy|sell "
+           "reload | arm | status | quit | param <id> <key> <val> | order <id> <sym> buy|sell "
            "open|close|closetoday <px> <lots> | cancel <cl_id> | transfer <sym> <from> "
            "<to> long|short <lots>\n");
     }
@@ -425,6 +480,24 @@ class LiveDriver {
     }
   }
 
+  // Periodic checkpoint between events (never mid-dispatch): the journal
+  // remains the primary record; this bounds the replay on a restart.
+  void maybe_snapshot(Nanos now) {
+    if (snap_path_.empty() || snap_interval_ <= 0) return;
+    if (last_snap_ == 0) {
+      last_snap_ = now;
+      return;
+    }
+    if (now - last_snap_ < snap_interval_) return;
+    last_snap_ = now;
+    if (save_snapshot(*site_, snap_path_, snap_fp_))
+      logf("[drv] snapshot -> %s (envelope %llu)\n", snap_path_.c_str(),
+           static_cast<unsigned long long>(site_->stream().next_seq()));
+    else
+      logf("[drv] WARNING: snapshot write failed (%s) — journal recovery still covers it\n",
+           snap_path_.c_str());
+  }
+
   SiteT* site_;
   Ring::Reader md_reader_;
   Ring::Reader trade_reader_;
@@ -434,9 +507,17 @@ class LiveDriver {
   std::priority_queue<Timer, std::vector<Timer>, std::greater<>> timers_;
   EodQueryFn eod_fn_ = nullptr;
   void* eod_ctx_ = nullptr;
+  LimitsLoaderFn limits_fn_ = nullptr;
+  void* limits_ctx_ = nullptr;
+  std::uint64_t limits_version_ = 0;
+  std::string snap_path_;
+  Nanos snap_interval_ = 0;
+  SessionFingerprint snap_fp_{};
+  Nanos last_snap_ = 0;
   Nanos last_cmd_poll_ = 0;
   bool trade_faulted_ = false;
   bool journal_faulted_ = false;
+  bool session_lost_ = false;
 };
 
 }  // namespace plat

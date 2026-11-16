@@ -46,6 +46,10 @@ using LiveSite = PackSite<plat::ctp::TraderClient>;
 // fleet_shard_ids from fleet_cfg.hpp, shared with platops)
 plat::PhaseSchedule schedule_from(const plat::Config& c);
 bool require_keys(const plat::Config& c);
+// Exchange trading-day calendar (optional `trade_calendar` file: one
+// `yyyymmdd` or `yyyymmdd-yyyymmdd` per line, `#` comments). A missing file
+// is an error when the key is set; an empty key means "no calendar".
+bool is_trading_day(const std::string& path, std::uint32_t day);
 void write_cmd_file(int shard, const std::string& cmd);
 
 // ---- per-strategy overnight carry (platd_positions.cpp): the counter
@@ -63,7 +67,8 @@ void carry_in_positions(LiveSite& site, plat::ctp::TraderClient& trader,
                         const std::vector<StratSpec>& specs);
 
 // ---- entry points
-int run_live(const plat::Config& cfg, bool force_resume = false);  // platd_live.cpp
+int run_live(const plat::Config& cfg, bool force_resume, const std::string& cfg_path,
+             int shard);                                                    // platd_live.cpp
 int run_fleet(const std::string& cfg_path);                        // platd_fleet.cpp
 int run_check(const plat::Config& cfg);                            // platd_tools.cpp
 int run_replay(const plat::Config& cfg, const std::string& jnl_path);

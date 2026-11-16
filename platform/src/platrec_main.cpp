@@ -264,7 +264,7 @@ int run_record(const Config& cfg) {
   ec_cfg.front = cfg.str("td_front");
   ec_cfg.broker_id = cfg.str("broker_id");
   ec_cfg.user_id = cfg.str("user_id");
-  ec_cfg.password = cfg.str("password");
+  ec_cfg.password = resolve_secret(cfg, "password");
   ec_cfg.investor_id = cfg.str("investor_id", cfg.str("user_id"));
   ec_cfg.app_id = cfg.str("app_id");
   ec_cfg.auth_code = cfg.str("auth_code");

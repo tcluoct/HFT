@@ -1,0 +1,14 @@
+# trade_calendar.example.txt — exchange trading days for `trade_calendar =`.
+#
+# One entry per line: a single yyyymmdd, or an inclusive yyyymmdd-yyyymmdd
+# range. `#` starts a comment. If the file is configured and today's trading
+# day (from the counter login) is not listed, platd refuses to start — a
+# mistyped phase timetable or a forgotten holiday cannot trade.
+#
+# Keep this file next to the deployment config, reviewed by the ops desk and
+# updated from the exchange's official calendar before each quarter.
+
+20260101
+20260102
+# ... add every trading day of the year, or use ranges for weekdays:
+# 20260302-20260306
