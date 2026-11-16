@@ -50,6 +50,7 @@ enum class Schema : std::uint16_t {
   ManualCancel,
   PositionTransfer,
   RiskLimits,
+  CarryIn,
 };
 
 // ---------------------------------------------------------------- market data
@@ -420,6 +421,22 @@ struct PositionTransferCmd {
 static_assert(std::is_trivially_copyable_v<PositionTransferCmd> &&
               sizeof(PositionTransferCmd) == 32);
 
+// Opening inventory at session start (overnight carry-in, §9.5). Source-
+// journaled once per attribution row so replay and the platops mirror
+// reconstruct carried lots and their cost basis exactly — a direct PnL poke
+// at startup would be invisible in the journal and make the mirror disagree.
+struct CarryInCmd {
+  Nanos ts;
+  Qty stock_qty;      // shares (0 for futures)
+  Qty fut_long_yd;    // carried long lots (yesterday)
+  Qty fut_short_yd;   // carried short lots (yesterday)
+  Price cost_px;      // cost basis (0 = instrument prev_close)
+  InstrumentId inst;
+  AccountId account;
+  StrategyId strategy;
+};
+static_assert(std::is_trivially_copyable_v<CarryInCmd> && sizeof(CarryInCmd) == 48);
+
 // ---------------------------------------------------------------- sessions
 
 enum class SessState : std::uint8_t { Down, LoggingIn, Up, Reconciling };
@@ -458,6 +475,7 @@ template <> struct MsgTraits<ParamUpdateEvt>  { static constexpr Schema schema =
 template <> struct MsgTraits<ManualOrderCmd>  { static constexpr Schema schema = Schema::ManualOrder;  static constexpr Topic topic = Topic::OrderFlow; };
 template <> struct MsgTraits<ManualCancelCmd> { static constexpr Schema schema = Schema::ManualCancel; static constexpr Topic topic = Topic::OrderFlow; };
 template <> struct MsgTraits<PositionTransferCmd> { static constexpr Schema schema = Schema::PositionTransfer; static constexpr Topic topic = Topic::Control; };
+template <> struct MsgTraits<CarryInCmd>     { static constexpr Schema schema = Schema::CarryIn;     static constexpr Topic topic = Topic::Control; };
 // clang-format on
 
 template <typename T>

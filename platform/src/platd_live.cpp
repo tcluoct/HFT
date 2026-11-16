@@ -601,7 +601,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
     // ---- carry-in (§9.5): the counter says how much is carried; yesterday's
     // .positions file says whose — per-strategy attribution restored here,
     // including books whose strategy is stopped this session.
-    carry_in_positions(site, trader, table, account, prev_positions, specs);
+    carry_in_positions(site, trader, table, account, prev_positions, specs, live_now_ns());
   }
 
   // ---- market data adapter.

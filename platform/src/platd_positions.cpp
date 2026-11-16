@@ -59,6 +59,27 @@ std::vector<PositionsRow> read_prev_positions(const std::string& jnl_path,
   return rows;
 }
 
+namespace {
+
+// Carry-in is a journaled Source event, not a direct PnL poke: replay and the
+// platops mirror rebuild the same carried book and cost basis from the log.
+void source_carry_in(LiveSite& site, Nanos ts, AccountId account, StrategyId strategy,
+                     InstrumentId inst, Qty stock_qty, Qty long_yd, Qty short_yd,
+                     Price cost_px) {
+  CarryInCmd c{};
+  c.ts = ts;
+  c.account = account;
+  c.strategy = strategy;
+  c.inst = inst;
+  c.stock_qty = stock_qty;
+  c.fut_long_yd = long_yd;
+  c.fut_short_yd = short_yd;
+  c.cost_px = cost_px;
+  site.source(c, ts);
+}
+
+}  // namespace
+
 // Fresh-start carry-in: the counter says how much is carried per
 // (instrument, direction); yesterday's file says whose it is. Attribution
 // rows are honored only while they fit inside the counter totals — including
@@ -69,7 +90,7 @@ std::vector<PositionsRow> read_prev_positions(const std::string& jnl_path,
 void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
                         const InstrumentTable& table, AccountId account,
                         const std::vector<PositionsRow>& prev,
-                        const std::vector<StratSpec>& specs) {
+                        const std::vector<StratSpec>& specs, Nanos ts) {
   const StrategyId fallback = specs.empty() ? StrategyId{0} : specs.front().id;
   const auto account_for = [&](StrategyId sid) {
     for (const auto& s : specs)
@@ -94,8 +115,9 @@ void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
       const Qty take = lots < remaining ? lots : remaining;
       if (take <= 0) break;
       const Price cost = p.is_long ? r.long_cost_e4 : r.short_cost_e4;
-      site.pnl().carry_in(account_for(r.strategy), r.strategy, id, 0, p.is_long ? take : 0,
-                          p.is_long ? 0 : take, cost ? cost : counter_cost);
+      source_carry_in(site, ts, account_for(r.strategy), r.strategy, id, 0,
+                      p.is_long ? take : 0, p.is_long ? 0 : take,
+                      cost ? cost : counter_cost);
       logf("[platd] carry-in %s %s yd %lld -> strategy %u (cost %.1f)\n", p.symbol,
            p.is_long ? "long" : "short", static_cast<long long>(take), r.strategy,
            px_to_cny(cost ? cost : counter_cost));
@@ -108,8 +130,8 @@ void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
 
     if (remaining > 0) {
       // Unattributed carry: manual trades or a missing/stale file.
-      site.pnl().carry_in(account_for(fallback), fallback, id, 0, p.is_long ? remaining : 0,
-                          p.is_long ? 0 : remaining, counter_cost);
+      source_carry_in(site, ts, account_for(fallback), fallback, id, 0,
+                      p.is_long ? remaining : 0, p.is_long ? 0 : remaining, counter_cost);
       if (!prev.empty())
         logf("[platd] WARNING: %s %s has %lld unattributed carried lots — assigned to "
              "strategy %u; review yesterday's .positions file\n",

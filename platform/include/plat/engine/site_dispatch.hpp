@@ -194,6 +194,15 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_b
     case Schema::ManualCancel:
       cancel(e.as<ManualCancelCmd>().cl_id);
       break;
+    case Schema::CarryIn: {
+      // Startup inventory is a deterministic Source event: replay and the
+      // platops mirror must rebuild the carried book + cost basis, not just
+      // today's fills.
+      const auto& c = e.as<CarryInCmd>();
+      pnl_.carry_in(c.account, c.strategy, c.inst, c.stock_qty, c.fut_long_yd,
+                    c.fut_short_yd, c.cost_px);
+      break;
+    }
     case Schema::PositionTransfer: {
       const auto& t = e.as<PositionTransferCmd>();
       const Qty moved =

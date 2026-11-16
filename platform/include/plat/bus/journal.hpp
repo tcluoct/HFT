@@ -28,8 +28,11 @@
 
 namespace plat {
 
-inline constexpr std::uint64_t kJournalMagic = 0x0100'4C4E'524A'4C50ull;  // "PLJRNL" v1
-inline constexpr std::uint16_t kJournalVersion = 1;
+inline constexpr std::uint64_t kJournalMagic = 0x0100'4C4E'524A'4C50ull;  // "PLJRNL"
+// v2 adds the RiskLimits and CarryIn schemas (and the limit state in
+// snapshots). A v1 reader refuses v2 outright instead of silently ignoring
+// envelopes it does not understand.
+inline constexpr std::uint16_t kJournalVersion = 2;
 
 struct JournalHeader {
   std::uint64_t magic = 0;

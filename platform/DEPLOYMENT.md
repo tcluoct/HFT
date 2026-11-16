@@ -266,7 +266,9 @@ What a resume does:
    that bounds a machine-crash window (default 100 ms, `0` = seal only). A
    journal that hit a **write error is never sealed** — it stays unsealed
    exactly like a crash, so an incomplete audit record can never be mistaken
-   for a complete one.
+   for a complete one. Carry-in positions are journaled Source `CarryInCmd`
+   events at session start, so replay and the platops mirror rebuild the
+   carried book and cost basis (not just today's fills).
 2. The whole prefix replays through a fresh engine with the **gateway
    muted** — strategy slots, OMS, PnL, risk counters and the kill switch are
    rebuilt to the exact crash point (state-hash verified in the tests);

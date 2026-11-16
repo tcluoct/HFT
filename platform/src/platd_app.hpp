@@ -64,7 +64,7 @@ std::vector<plat::PositionsRow> read_prev_positions(const std::string& jnl_path,
 void carry_in_positions(LiveSite& site, plat::ctp::TraderClient& trader,
                         const plat::InstrumentTable& table, plat::AccountId account,
                         const std::vector<plat::PositionsRow>& prev,
-                        const std::vector<StratSpec>& specs);
+                        const std::vector<StratSpec>& specs, plat::Nanos now);
 
 // ---- entry points
 int run_live(const plat::Config& cfg, bool force_resume, const std::string& cfg_path,

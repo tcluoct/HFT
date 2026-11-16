@@ -4,9 +4,11 @@
 // mirror sites are fed from. Everything enters as a journaled Source
 // envelope — the same contract as every other boundary crossing.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include "plat/bus/journal.hpp"
 #include "plat/ops/auth.hpp"
@@ -233,6 +235,7 @@ void test_ops_mirror() {
   CHECK(desk::parse_strategies(cfg, AccountId{1}, specs));
 
   std::uint64_t live_hash = 0;
+  std::uint64_t live_seq = 0;
   OrderId manual_id = kNoOrder;
   {
     InstrumentTable table = one_future();
@@ -251,6 +254,18 @@ void test_ops_mirror() {
                       desk::Pack::banks(cfg, table, specs));
     FakeGateway gw;
     site.set_gateway(&gw);
+
+    // Startup carry-in must be a journaled Source event: the mirror has no
+    // other way to learn the carried book/cost basis (a direct PnL poke would
+    // make the mirror's positions and PnL disagree with live).
+    CarryInCmd carry{};
+    carry.ts = at_time(8, 58);
+    carry.account = 1;
+    carry.strategy = 1;
+    carry.inst = 0;
+    carry.fut_long_yd = 3;
+    carry.cost_px = px_from_cny(78'000.0);
+    site.source(carry, carry.ts);
 
     PhaseChangeEvt ph{};
     ph.ts = at_time(9, 0);
@@ -306,19 +321,33 @@ void test_ops_mirror() {
     site.source(t, t.ts);
 
     live_hash = site.state_hash();
+    live_seq = site.stream().next_seq();
     site.run_eod({}, 2, 0);  // drain + seal so the bytes are on disk
   }
 
-  // The mirror sees only the files.
+  // The mirror sees only the files. A single poll() returning false only means
+  // "no new envelope yet"; pump it until it has consumed the sealed journal
+  // (a freshly written file can take a moment to become visible).
+  const auto pump = [&](platops::MirrorShard& sh) {
+    for (int spins = 0; spins < 250; ++spins) {
+      sh.poll();
+      if (sh.site() && sh.site()->stream().next_seq() >= live_seq) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  };
   platops::MirrorShard sh("mirror_test", cfg);
-  int spins = 0;
-  while (sh.poll() && ++spins < 100) {}
+  pump(sh);
+  sh.poll();  // idle pass: sealed journal => parity check
+  CHECK(sh.parity_checked() && sh.parity_ok());
   CHECK(sh.site() != nullptr);
+  if (!sh.site()) return;
   CHECK(sh.site()->state_hash() == live_hash);  // byte-identical reconstruction
+  const Position* carried = sh.site()->pnl().find(1, 1, 0);
+  CHECK(carried && carried->long_yd == 1);      // 3 carried - 2 transferred (yd first)
   CHECK(sh.fills().size() == 1);
   CHECK(sh.ops_log().size() == 3);  // param + manual order + transfer
   const Position* moved = sh.site()->pnl().find(1, 2, 0);
-  CHECK(moved && moved->long_td == 2);
+  CHECK(moved && moved->long_yd == 2);
   const auto resting = sh.site()->oms().open_orders(0);
   CHECK(resting.size() == 1);
   if (resting.size() == 1) CHECK(resting[0]->cl_id == manual_id);
@@ -326,7 +355,7 @@ void test_ops_mirror() {
   // And the JSON document the web page polls carries the essentials.
   std::vector<std::unique_ptr<platops::MirrorShard>> shards;
   shards.push_back(std::make_unique<platops::MirrorShard>("mirror_test", cfg));
-  while (shards[0]->poll()) {}
+  pump(*shards[0]);
   const std::string j = platops::build_state_json(shards, at_time(15, 0));
   CHECK(j.find("\"status\":\"sealed\"") != std::string::npos);
   CHECK(j.find("cu2609") != std::string::npos);

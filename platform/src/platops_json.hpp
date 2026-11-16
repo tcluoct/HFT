@@ -330,6 +330,8 @@ inline void json_alerts(std::string& o, MirrorShard& sh, Nanos now) {
     for (const DenyRow& d : sh.denies())
       if (now - d.ts < 60 * kNsPerSec) ++recent;
     if (recent >= 10) add("risk deny burst: " + std::to_string(recent) + " in 60s");
+    if (sh.parity_checked() && !sh.parity_ok())
+      add("MIRROR MISMATCH: build/desk/config differs — PnL not the live record");
   }
   o += ']';
 }
@@ -365,6 +367,9 @@ inline std::string build_state_json(std::vector<std::unique_ptr<MirrorShard>>& s
     o += std::to_string(site ? static_cast<int>(site->session_state()) : 0);
     o += ',';
     jkey(o, "envelopes"); o += std::to_string(sh.envelopes()); o += ',';
+    jkey(o, "parity");
+    jstr(o, !sh.parity_checked() ? "pending" : (sh.parity_ok() ? "ok" : "MISMATCH"));
+    o += ',';
     jkey(o, "md_age_ms");
     o += std::to_string(sh.last_md_ts() && now > sh.last_md_ts()
                             ? (now - sh.last_md_ts()) / kNsPerMs

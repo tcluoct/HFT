@@ -89,13 +89,26 @@ class MirrorShard {
       envelopes_ = 0;
       last_env_ts_ = last_md_ts_ = 0;
       phase_ = Phase::Closed;
+      parity_checked_ = false;
+      parity_ok_ = false;
     }
     if (!site_ && !rebuild()) return false;  // sidecar not written yet — retry
     batch_.clear();
-    if (tail_.read(batch_) == 0) return false;
+    const std::size_t got = tail_.read(batch_);
+    if (got == 0) {
+      check_parity();  // sealed journal: verify the regenerated stream
+      return false;
+    }
     for (const Envelope& e : batch_) absorb(e);
     return true;
   }
+
+  // Once a sealed journal has been fully tailed, the mirror's regenerated
+  // canonical stream must hash equal to the journal's recorded hash. This is
+  // the production parity alarm: a different build/desk/config that still
+  // parses would otherwise show plausible but wrong PnL/positions.
+  [[nodiscard]] bool parity_checked() const noexcept { return parity_checked_; }
+  [[nodiscard]] bool parity_ok() const noexcept { return parity_ok_; }
 
   // ---- read side for the JSON builder (single-threaded with poll()).
   [[nodiscard]] const std::string& name() const noexcept { return name_; }
@@ -142,12 +155,22 @@ class MirrorShard {
     return true;
   }
 
+  void check_parity() {
+    if (parity_checked_ || !site_ || !tail_.header().sealed) return;
+    parity_checked_ = true;
+    parity_ok_ = site_->stream().stream_hash() == tail_.header().stream_hash;
+    if (!parity_ok_)
+      logf("[ops] %s: MIRROR MISMATCH — regenerated stream hash differs from the sealed "
+           "journal (build/desk/config differ); PnL/positions on this page are NOT the live "
+           "record\n",
+           name_.c_str());
+  }
+
   void absorb(const Envelope& e) {
     ++envelopes_;
     last_env_ts_ = e.ts;
     if (e.origin == Origin::Source) site_->inject(e);  // Derived regenerates inside
-    switch (e.schema) {  // UI feeds read the journal record itself
-      case Schema::MdSnapshot:
+    switch (e.schema) {  // UI feeds read the journal record itself      case Schema::MdSnapshot:
         last_md_ts_ = e.ts;
         break;
       case Schema::PhaseChange:
@@ -240,6 +263,8 @@ class MirrorShard {
   Nanos last_env_ts_ = 0;
   Nanos last_md_ts_ = 0;
   Phase phase_ = Phase::Closed;
+  bool parity_checked_ = false;
+  bool parity_ok_ = false;
 };
 
 }  // namespace platops
