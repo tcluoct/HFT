@@ -188,7 +188,10 @@ Startup sequence, all logged to stderr: connect → authenticate → login →
 settlement confirm → instrument/limit/margin queries → position carry-in →
 journal + instrument sidecar (`<journal>.ref`) written → md subscribe →
 pre-flight → armed. A red pre-flight halts the site (orders denied) until an
-operator fixes the cause and types `disarm` then `arm`.
+operator fixes the cause and types `disarm` then `arm`. Journal failures,
+incomplete broker queries, unexplained recovery orders/fills, and unresolved
+reconciliation markers instead require repair/reconciliation and a restart;
+`disarm` cannot override these physical safety interlocks.
 
 **Operator console** (type into the running process):
 
@@ -284,11 +287,28 @@ What a resume does:
    **synthesized as Source exec reports** (journaled — the recovery itself
    replays); orders still working at the venue are **adopted** into the new
    session (cancellable, and their future fills route correctly); orders the
-   venue no longer knows are closed out locally; per-instrument positions
-   are compared against the counter and any break is printed loudly.
-4. The site starts **HALTED**. The operator reviews the reconciliation
-   summary and position breaks, then types `disarm` and `arm` (or writes
-   them to `shardN.cmd`) to resume trading.
+   venue no longer knows are closed out locally. Failed or partial queries
+   are never treated as empty results. Orders/fills on hosted instruments
+   without a durable venue identity, including unacknowledged orders, lock
+   trading for manual review rather than guessing strategy ownership.
+   Positions are compared by long/short and yesterday/today buckets, not
+   just net quantity. A discrepancy also locks trading. The gateway stays
+   muted throughout replay, phase updates and synthesized recovery fills.
+4. The site starts **HALTED**. A clean reconciliation without a prior pending
+   marker permits `disarm` and `arm` after operator review. An unresolved
+   marker or safety interlock cannot be cleared by these commands.
+
+**Durable next-start gate.** Before trading, platd creates and syncs
+`<journal>.eod-breaks` as a pending-session record. Failure to create/sync it
+aborts startup. Only successful EOD queries, clean reconciliation, a healthy
+sealed journal and no safety interlock allow its removal. A preexisting
+record is preserved even if the new session appears clean. On an incident,
+review the broker's open orders, fills and gross position buckets against
+the saved journal and report; cancel/resolve unexplained orders at the
+broker and correct the recovery inputs. Stop the daemon before removing the
+reviewed marker and restarting. Do not remove it merely to silence a halt.
+Intraday positions without recoverable attribution also block fresh-start
+trading; resolve them at the broker or restore the correct recovery record.
 
 Resume is same-day only — a new trading day starts fresh with carry-in.
 Note the safe default: a resumed site never sends an order until a human

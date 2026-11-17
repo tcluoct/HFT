@@ -19,6 +19,8 @@
 #include "plat/ctp/md_client.hpp"
 #include "plat/engine/fingerprint.hpp"
 #include "plat/engine/live.hpp"
+#include "plat/engine/reconcile.hpp"
+#include "plat/engine/session_marker.hpp"
 #include "plat/engine/report.hpp"
 #include "plat/engine/snapshot.hpp"
 #include "plat/replay/sidecar.hpp"
@@ -31,143 +33,17 @@ namespace {
 
 struct EodBridge {
   ctp::TraderClient* trader;
-  static void query(void* ctx, std::vector<VenueOpenOrder>& open, Qty& buy, Qty& sell) {
+  static bool query(void* ctx, std::vector<VenueOpenOrder>& open, Qty& buy, Qty& sell) {
     auto* self = static_cast<EodBridge*>(ctx);
-    open = self->trader->query_open_orders();
+    const auto orders = self->trader->query_open_orders();
     const auto t = self->trader->query_trade_totals();
-    buy = t.buy_qty;
-    sell = t.sell_qty;
+    if (!orders || !t) return false;
+    open = *orders;
+    buy = t->buy_qty;
+    sell = t->sell_qty;
+    return true;
   }
 };
-
-// Crash-recovery reconciliation (§11.2): after the journal replay restored
-// state to the crash point, true it up against the counter — fills that
-// landed while we were dead become synthesized Source ExecReports (journaled,
-// so the recovery itself replays), orders still working at the venue are
-// adopted into the new session's registry, and orders the venue no longer
-// knows are closed out locally.
-template <typename SiteT>
-void reconcile_resume(SiteT& site, ctp::TraderClient& trader, const InstrumentTable& table) {
-  const auto acct_open = trader.query_account_open_orders();
-  const auto acct_trades = trader.query_account_trades();
-  const Nanos now = live_now_ns();
-  int adopted = 0, synth_fills = 0, closed = 0, unacked = 0;
-
-  for (const InstrumentId inst : site.config().hosted) {
-    for (const OmsOrder* o : site.oms().open_orders(inst)) {
-      const Instrument& in = table.at(inst);
-      const std::uint64_t seq = o->cl_id & 0xFFFF'FFFF'FFFFull;
-      const auto is_ours_row = [&](std::uint64_t row_venue_no, std::uint64_t row_ref,
-                                   const char* row_sym) {
-        return o->venue_no != 0 ? row_venue_no == o->venue_no
-                                : (row_ref == seq && in.sym() == row_sym);
-      };
-
-      // Fills the dead process never saw: venue trades beyond our cum.
-      Qty applied = o->cum;
-      Qty skip = o->cum;
-      const ctp::AccountOpenOrder* live_row = nullptr;
-      for (const auto& a : acct_open)
-        if (is_ours_row(a.venue_no, a.ref_seq, a.symbol)) live_row = &a;
-
-      // Un-acked at crash but alive at the venue: synthesize the ack first.
-      if (o->state == OrderState::PendingNew && live_row) {
-        ExecReport ack{};
-        ack.cl_id = o->cl_id;
-        ack.venue_no = live_row->venue_no;
-        ack.ts = now;
-        ack.px = o->px;
-        ack.leaves = o->leaves;
-        ack.inst = inst;
-        ack.strategy = o->strategy;
-        ack.account = o->account;
-        ack.type = ExecType::Ack;
-        ack.side = o->side;
-        ack.offset = o->offset;
-        site.source(ack, now);
-      }
-
-      for (const auto& t : acct_trades) {
-        if (!is_ours_row(t.venue_no, t.ref_seq, t.symbol)) continue;
-        Qty take = t.qty;
-        if (skip > 0) {
-          const Qty s = skip < take ? skip : take;
-          skip -= s;
-          take -= s;
-        }
-        if (take <= 0) continue;
-        ExecReport fill{};
-        fill.cl_id = o->cl_id;
-        fill.venue_no = o->venue_no ? o->venue_no : t.venue_no;
-        fill.ts = now;
-        fill.px = t.px;
-        fill.qty = take;
-        fill.cum = applied + take;
-        fill.leaves = o->qty - (applied + take);
-        fill.inst = inst;
-        fill.strategy = o->strategy;
-        fill.account = o->account;
-        fill.type = ExecType::Fill;
-        fill.side = o->side;
-        fill.offset = o->offset;
-        site.source(fill, now);
-        applied += take;
-        ++synth_fills;
-      }
-
-      if (applied >= o->qty) continue;  // fully filled while dead: OMS closed it above
-      if (live_row) {
-        trader.adopt_order(o->cl_id, inst, o->strategy, o->account, o->side, o->offset,
-                           o->px, o->qty, applied, in.symbol, live_row->exchange,
-                           live_row->sys_id);
-        ++adopted;
-      } else {
-        // The venue no longer knows it (canceled/expired while dead, or it
-        // never arrived): terminal locally so no strategy waits forever.
-        if (o->venue_no == 0) ++unacked;
-        ExecReport cxl{};
-        cxl.cl_id = o->cl_id;
-        cxl.venue_no = o->venue_no;
-        cxl.ts = now;
-        cxl.px = o->px;
-        cxl.cum = applied;
-        cxl.leaves = 0;
-        cxl.inst = inst;
-        cxl.strategy = o->strategy;
-        cxl.account = o->account;
-        cxl.type = ExecType::Canceled;
-        cxl.side = o->side;
-        cxl.offset = o->offset;
-        site.source(cxl, now);
-        ++closed;
-      }
-    }
-  }
-
-  // Position truth check: our per-instrument net vs the counter's account
-  // view. Mismatches demand operator review before disarming.
-  int breaks = 0;
-  const auto counter_pos = trader.query_positions();
-  for (const InstrumentId inst : site.config().hosted) {
-    Qty ours = 0;  // every book, live or stopped — the counter view is total
-    site.pnl().for_each([&](const PosKey& k, const Position& p) {
-      if (k.inst == inst) ours += p.net();
-    });
-    Qty venue = 0;
-    for (const auto& p : counter_pos)
-      if (table.at(inst).sym() == p.symbol) venue += p.is_long ? p.total : -p.total;
-    if (ours != venue) {
-      ++breaks;
-      logf("[resume] POSITION BREAK %s: ours %lld vs counter %lld\n",
-                   table.at(inst).symbol, static_cast<long long>(ours),
-                   static_cast<long long>(venue));
-    }
-  }
-
-  logf("[resume] reconciled with counter: %d fills synthesized, %d orders adopted, "
-               "%d closed locally (%d were never acked), %d position breaks\n",
-               synth_fills, adopted, closed, unacked, breaks);
-}
 
 // Move a leftover journal (and its sidecar) out of the way instead of ever
 // truncating it — the journal is the audit record, whatever state it's in.
@@ -268,12 +144,16 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   // session starts HALTED until an operator reviews the report and removes
   // it — a break must never be silently traded through.
   const std::string eod_breaks_path = jnl_path + ".eod-breaks";
-  std::error_code breaks_ec;
-  const bool eod_breaks_pending = std::filesystem::exists(eod_breaks_path, breaks_ec);
-  if (eod_breaks_pending)
-    logf("[platd] EOD BREAKS PENDING from a previous session (%s) — this site will start "
-         "HALTED; review the EOD report, then delete the marker and `disarm` + `arm`\n",
+  SessionMarker marker(eod_breaks_path);
+  if (!marker.begin()) {
+    logf("[platd] cannot durably establish reconciliation gate %s — refusing startup\n",
          eod_breaks_path.c_str());
+    return 1;
+  }
+  const bool eod_breaks_pending = marker.preexisting();
+  if (eod_breaks_pending)
+    logf("[platd] pending reconciliation marker: trading locked. Review counter/orders, "
+         "stop this process, remove %s, then restart.\n", eod_breaks_path.c_str());
   InstrumentTable table;
   std::vector<InstrumentId> hosted;
   Venue site_venue = Venue::SHFE;
@@ -522,8 +402,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
          static_cast<long long>(sc.limits.max_order_qty), sc.limits.max_actions_per_sec,
          sc.limits.max_actions_per_day);
   }
-  if (eod_breaks_pending)
-    site.command_kill(KillScope::Site, KillAction::Halt, 0, live_now_ns());
+  if (eod_breaks_pending) site.block_trading();
 
   // Operator-configured order/cancel-count alerts (§10.2) — off by default;
   // set comp.order_count_alert / comp.cancel_count_alert to exercise them.
@@ -571,7 +450,6 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
       }
       logf("[resume] no usable snapshot — full replay of %zu envelope(s)\n", total);
     }
-    site.set_recovering(false);
     {
       std::error_code snap_ec;
       if (used_snapshot) {
@@ -593,15 +471,21 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
     pe.phase = schedule_from(cfg).phase_at(pe.ts);
     site.source(pe, pe.ts);
 
-    reconcile_resume(site, trader, table);
+    // Keep the gateway muted through phase changes and synthesized fills.
+    reconcile_resume(site, trader, table, live_now_ns());
+    site.set_recovering(false);
     site.command_kill(KillScope::Site, KillAction::Halt, 0, live_now_ns());
-    logf("[resume] site is HALTED. Review positions/breaks above, then `disarm` "
-                 "and `arm` to trade.\n");
+    if (site.safety_blocked())
+      logf("[resume] safety interlock LOCKED: resolve broker discrepancies, stop, "
+           "review/remove the pending marker, then restart. Disarm cannot bypass this.\n");
+    else
+      logf("[resume] site is HALTED. Review reconciliation, then `disarm` and `arm`.\n");
   } else {
     // ---- carry-in (§9.5): the counter says how much is carried; yesterday's
     // .positions file says whose — per-strategy attribution restored here,
     // including books whose strategy is stopped this session.
-    carry_in_positions(site, trader, table, account, prev_positions, specs, live_now_ns());
+    if (!carry_in_positions(site, trader, table, account, prev_positions, specs, live_now_ns()))
+      site.block_trading();
   }
 
   // ---- market data adapter.
@@ -634,35 +518,14 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
                       session_fp);
   driver.run();
 
-  // ---- EOD reconciliation gate (§11.3). Any order/fill break against the
-  // counter must be reviewed before the next session trades: leave a marker
-  // that starts the next run HALTED. A clean reconciliation clears it.
-  if (site.eod().ran) {
-    const auto& eod_result = site.eod();
-    if (eod_result.order_breaks > 0 || !eod_result.fills_ok) {
-      std::FILE* f = std::fopen(eod_breaks_path.c_str(), "wb");
-      if (f) {
-        std::fprintf(f,
-                     "day=%u site=%u order_breaks=%zu fills_ok=%d venue_buy=%lld "
-                     "venue_sell=%lld\nreview the EOD report, then delete this file and "
-                     "`disarm` + `arm`\n",
-                     sc.day, static_cast<unsigned>(sc.id), eod_result.order_breaks,
-                     eod_result.fills_ok ? 1 : 0, static_cast<long long>(eod_result.venue_buy),
-                     static_cast<long long>(eod_result.venue_sell));
-        std::fclose(f);
-        logf("[platd] EOD BREAKS: %zu order break(s), fills %s — wrote %s; the next "
-             "session starts HALTED until this is reviewed\n",
-             eod_result.order_breaks, eod_result.fills_ok ? "OK" : "BREAK",
-             eod_breaks_path.c_str());
-      } else {
-        logf("[platd] ERROR: EOD BREAKS and cannot write %s — next start will NOT be gated\n",
-             eod_breaks_path.c_str());
-      }
-    } else {
-      std::error_code clear_ec;
-      std::filesystem::remove(eod_breaks_path, clear_ec);
-    }
-  }
+  // The durable marker predates all trading. Only a fully clean session may
+  // remove it; disk errors, query failures and recovery breaks leave it intact.
+  const bool clean = site.eod().ran && site.eod().order_breaks == 0 &&
+                     site.eod().fills_ok && site.journal_healthy() && !site.safety_blocked();
+  const bool gate_cleared = marker.complete(clean);
+  if (!gate_cleared)
+    logf("[platd] reconciliation gate retained: review %s before restart\n",
+         eod_breaks_path.c_str());
 
   // ---- per-strategy attribution for tomorrow's carry-in.
   write_eod_positions(site, table, jnl_path);
@@ -679,11 +542,11 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   });
   for (const StrategyId id : carried_only) report += pnl_report(site, id, "carried, not running");
   const auto funds = trader.query_funds();
-  if (funds.found) {
+  if (funds && funds->found) {
     char buf[192];
     std::snprintf(buf, sizeof(buf),
                   "account %s funds: balance %.2f available %.2f margin %.2f CNY\n",
-                  funds.account_id, funds.balance, funds.available, funds.margin);
+                  funds->account_id, funds->balance, funds->available, funds->margin);
     report += buf;
   }
   std::printf("%s", report.c_str());
@@ -695,7 +558,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
 
   md.stop();
   trader.stop();
-  return 0;
+  return gate_cleared ? 0 : 1;
 }
 
 }  // namespace platd

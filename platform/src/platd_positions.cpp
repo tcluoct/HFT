@@ -87,7 +87,7 @@ void source_carry_in(LiveSite& site, Nanos ts, AccountId account, StrategyId str
 // marked and margined, until re-enabled). Any remainder — manual trades, a
 // lost file, another terminal on the account — lands on the first configured
 // instance's book with a loud warning (id 0 = unattributed if none run).
-void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
+bool carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
                         const InstrumentTable& table, AccountId account,
                         const std::vector<PositionsRow>& prev,
                         const std::vector<StratSpec>& specs, Nanos ts) {
@@ -97,7 +97,10 @@ void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
       if (s.id == sid) return s.account;
     return account;
   };
-  for (const auto& p : trader.query_positions()) {
+  const auto positions = trader.query_positions();
+  if (!positions) return false;
+  bool complete = true;
+  for (const auto& p : *positions) {
     const InstrumentId id = table.find(p.symbol);
     if (id == kNoInstrument) continue;  // position in an unhosted instrument
     const Instrument& in = table.at(id);
@@ -143,11 +146,14 @@ void carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
              fallback);
     }
 
-    if (p.total != p.yd)
+    if (p.total != p.yd) {
+      complete = false;
       logf("[platd] WARNING: %s has today-opened lots at the counter (%lld td); start "
            "platd before the session opens\n",
            p.symbol, static_cast<long long>(p.total - p.yd));
+    }
   }
+  return complete;
 }
 
 }  // namespace platd

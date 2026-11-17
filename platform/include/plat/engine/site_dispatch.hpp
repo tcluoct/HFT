@@ -234,7 +234,7 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_new_order(const NewOrderReq& 
   if (verdict == kRiskPass) [[likely]] {
     // Submit before compliance accounting. Timestamp capture is explicit
     // at the gateway boundary; API return is not a NIC transmit timestamp.
-    if (mode_ == Mode::Live && gw_ && !recovering_) {
+    if (mode_ == Mode::Live && gw_ && !recovering_ && trading_permitted()) {
       const auto sent = latency_.now();
       latency_.order_sent(r.cl_id, sent);
       gw_->place(r);

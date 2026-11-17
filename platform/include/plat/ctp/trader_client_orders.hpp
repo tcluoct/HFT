@@ -210,12 +210,14 @@ inline void TraderClient::OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoCon
   set_state(SessState::Up);
 }
 
-inline void TraderClient::OnRspError(CThostFtdcRspInfoField* info, int, bool) {
+inline void TraderClient::OnRspError(CThostFtdcRspInfoField* info, int request_id, bool) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
   if (info) logf("[td] rsp error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
   // A failed request's terminal response can land here instead of the
   // typed callback — wake any pending query as ERRORED, or it would burn
   // its whole timeout in silence (the "counter not ready yet" symptom).
-  qry_error_ = info ? info->ErrorID : -1;
+  qry_error_ = info && info->ErrorID ? info->ErrorID : -1;
   finish_query();
 }
 

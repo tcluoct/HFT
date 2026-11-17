@@ -30,6 +30,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -158,19 +159,19 @@ class TraderClient final : public CThostFtdcTraderSpi {
 
   DepthMeta query_depth(const char* symbol);
 
-  std::vector<PositionRow> query_positions();
+  std::optional<std::vector<PositionRow>> query_positions();
 
-  std::vector<VenueOpenOrder> query_open_orders();
+  std::optional<std::vector<VenueOpenOrder>> query_open_orders();
 
-  TradeTotals query_trade_totals();
+  std::optional<TradeTotals> query_trade_totals();
 
   // ------------------------------------------------- crash-recovery queries
   // Account-wide views (NOT session-filtered — the crashed session is gone;
   // its orders now look foreign). Used only by --resume reconciliation.
 
-  std::vector<AccountOpenOrder> query_account_open_orders();
+  std::optional<std::vector<AccountOpenOrder>> query_account_open_orders();
 
-  std::vector<AccountTrade> query_account_trades();
+  std::optional<std::vector<AccountTrade>> query_account_trades();
 
   // Adopt a crashed session's still-open order into this session's registry:
   // subsequent OnRtnOrder/OnRtnTrade for it route here (matched by its
@@ -179,7 +180,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
                    Side side, Offset offset, Price px, Qty qty, Qty cum,
                    const char* symbol, const char* exchange, const char* sys_id);
 
-  AccountFunds query_funds();
+  std::optional<AccountFunds> query_funds();
 
   // ------------------------------------------------------- CTP callbacks
 
@@ -241,6 +242,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
                               int, bool bIsLast) override;
 
  private:
+  friend struct TraderClientTestAccess;
   struct OrderCtx {
     OrderId cl_id = kNoOrder;
     std::uint64_t venue_no = 0;
@@ -293,7 +295,8 @@ class TraderClient final : public CThostFtdcTraderSpi {
   // Returns whether the counter answered at all (a timeout means "ask
   // again", never "the thing you asked about does not exist").
   template <typename SendFn>
-  bool run_query(SendFn&& send);
+  bool run_query(SendFn&& send, std::chrono::milliseconds timeout = std::chrono::seconds(10));
+  // Called with qry_state_mtx_ held; stale/foreign callbacks never touch results.
   void finish_query();
 
   TraderConfig cfg_;
@@ -317,6 +320,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
   std::condition_variable qry_cv_;
   bool qry_done_ = false;
   int qry_error_ = 0;         // ErrorID of the pending query's response (0 = clean)
+  int qry_request_id_ = 0;    // zero retires a completed or timed-out query
   InstrumentMeta qry_instrument_{};
   char qry_instrument_symbol_[32]{};
   DepthMeta qry_depth_{};
@@ -334,7 +338,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
   int front_id_ = 0;
   int session_id_ = 0;
   std::uint32_t trading_day_ = 0;
-  int req_id_ = 0;
+  std::atomic<int> req_id_{0};
 };
 
 static_assert(OrderGateway<TraderClient>,

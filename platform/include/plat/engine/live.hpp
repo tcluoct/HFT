@@ -187,6 +187,7 @@ class LiveDriver {
         // Audit hole (journal thread lapped): we do not trade without a
         // complete record — fail closed (§7.2).
         journal_faulted_ = true;
+        site_->block_trading();
         logf("[drv] JOURNAL FAULT — halting site\n");
         site_->command_kill(KillScope::Site, KillAction::Halt, 0, now);
       }
@@ -210,7 +211,7 @@ class LiveDriver {
 
   // EOD reconciliation inputs are queried by main (it owns the concrete
   // TraderClient); the driver signals readiness through this hook.
-  using EodQueryFn = void (*)(void* ctx, std::vector<VenueOpenOrder>& open, Qty& buy, Qty& sell);
+  using EodQueryFn = bool (*)(void* ctx, std::vector<VenueOpenOrder>& open, Qty& buy, Qty& sell);
   void set_eod_query(EodQueryFn fn, void* ctx) {
     eod_fn_ = fn;
     eod_ctx_ = ctx;
@@ -380,6 +381,10 @@ class LiveDriver {
       if (scoped) logf("[ops] strategy %u FLATTEN commanded\n", target);
       else logf("[ops] site FLATTEN commanded\n");
     } else if (verb == "disarm") {
+      if (!site_->trading_permitted()) {
+        logf("[ops] disarm refused: repair/reconcile and restart; safety interlock is active\n");
+        return true;
+      }
       site_->command_kill(scope, KillAction::Disarm, target, now);
       if (scoped) logf("[ops] strategy %u disarmed — trading again\n", target);
       else logf("[ops] kill switch disarmed\n");
@@ -465,8 +470,12 @@ class LiveDriver {
     }
     std::vector<VenueOpenOrder> open;
     Qty buy = 0, sell = 0;
-    if (eod_fn_) eod_fn_(eod_ctx_, open, buy, sell);
-    site_->run_eod(open, buy, sell);
+    const bool query_ok = eod_fn_ && eod_fn_(eod_ctx_, open, buy, sell);
+    if (!query_ok) {
+      site_->block_trading();
+      logf("[drv] EOD query failed: reconciliation is NOT clean\n");
+    }
+    site_->run_eod(open, buy, sell, query_ok);
     logf("[drv] EOD done: recon vs counter (%zu open, buy/sell %lld/%lld) — journal "
          "sealed\n",
          open.size(), static_cast<long long>(buy), static_cast<long long>(sell));

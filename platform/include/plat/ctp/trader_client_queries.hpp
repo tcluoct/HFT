@@ -13,7 +13,7 @@ inline InstrumentMeta TraderClient::query_instrument(const char* symbol) {
   std::snprintf(qry_instrument_symbol_, sizeof(qry_instrument_symbol_), "%s", symbol);
   CThostFtdcQryInstrumentField q{};
   std::snprintf(q.InstrumentID, sizeof(q.InstrumentID), "%s", symbol);
-  const bool done = run_query([&] { return api_->ReqQryInstrument(&q, ++req_id_); });
+  const bool done = run_query([&](int request_id) { return api_->ReqQryInstrument(&q, request_id); });
   qry_instrument_.answered = done && qry_error_ == 0;
   return qry_instrument_;
 }
@@ -24,81 +24,89 @@ inline DepthMeta TraderClient::query_depth(const char* symbol) {
   std::snprintf(qry_depth_symbol_, sizeof(qry_depth_symbol_), "%s", symbol);
   CThostFtdcQryDepthMarketDataField q{};
   std::snprintf(q.InstrumentID, sizeof(q.InstrumentID), "%s", symbol);
-  const bool done = run_query([&] { return api_->ReqQryDepthMarketData(&q, ++req_id_); });
+  const bool done = run_query([&](int request_id) { return api_->ReqQryDepthMarketData(&q, request_id); });
   qry_depth_.answered = done && qry_error_ == 0;
   return qry_depth_;
 }
 
-inline std::vector<PositionRow> TraderClient::query_positions() {
+inline std::optional<std::vector<PositionRow>> TraderClient::query_positions() {
   std::lock_guard qlk(qry_mtx_);
   qry_positions_.clear();
   CThostFtdcQryInvestorPositionField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryInvestorPosition(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryInvestorPosition(&q, request_id); });
+  if (!ok) return std::nullopt;
   return qry_positions_;
 }
 
-inline std::vector<VenueOpenOrder> TraderClient::query_open_orders() {
+inline std::optional<std::vector<VenueOpenOrder>> TraderClient::query_open_orders() {
   std::lock_guard qlk(qry_mtx_);
   qry_open_orders_.clear();
   qry_foreign_open_ = 0;
   CThostFtdcQryOrderField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryOrder(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryOrder(&q, request_id); });
+  if (!ok) return std::nullopt;
   return qry_open_orders_;
 }
 
-inline TradeTotals TraderClient::query_trade_totals() {
+inline std::optional<TradeTotals> TraderClient::query_trade_totals() {
   std::lock_guard qlk(qry_mtx_);
   qry_trades_ = TradeTotals{};
   CThostFtdcQryTradeField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryTrade(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryTrade(&q, request_id); });
+  if (!ok) return std::nullopt;
   return qry_trades_;
 }
 
-inline std::vector<AccountOpenOrder> TraderClient::query_account_open_orders() {
+inline std::optional<std::vector<AccountOpenOrder>> TraderClient::query_account_open_orders() {
   std::lock_guard qlk(qry_mtx_);
   qry_acct_open_.clear();
   qry_acct_open_active_ = true;
   CThostFtdcQryOrderField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryOrder(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryOrder(&q, request_id); });
   qry_acct_open_active_ = false;
+  if (!ok) return std::nullopt;
   return qry_acct_open_;
 }
 
-inline std::vector<AccountTrade> TraderClient::query_account_trades() {
+inline std::optional<std::vector<AccountTrade>> TraderClient::query_account_trades() {
   std::lock_guard qlk(qry_mtx_);
   qry_acct_trades_.clear();
   qry_acct_trades_active_ = true;
   CThostFtdcQryTradeField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryTrade(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryTrade(&q, request_id); });
   qry_acct_trades_active_ = false;
+  if (!ok) return std::nullopt;
   return qry_acct_trades_;
 }
 
-inline AccountFunds TraderClient::query_funds() {
+inline std::optional<AccountFunds> TraderClient::query_funds() {
   std::lock_guard qlk(qry_mtx_);
   qry_funds_ = AccountFunds{};
   CThostFtdcQryTradingAccountField q{};
   std::snprintf(q.BrokerID, sizeof(q.BrokerID), "%s", cfg_.broker_id.c_str());
   std::snprintf(q.InvestorID, sizeof(q.InvestorID), "%s", cfg_.investor_id.c_str());
-  run_query([&] { return api_->ReqQryTradingAccount(&q, ++req_id_); });
+  const bool ok = run_query([&](int request_id) { return api_->ReqQryTradingAccount(&q, request_id); });
+  if (!ok) return std::nullopt;
   return qry_funds_;
 }
 
 inline void TraderClient::OnRspQryInstrument(CThostFtdcInstrumentField* in, CThostFtdcRspInfoField* info,
-                        int, bool bIsLast) {
+                        int request_id, bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (info && info->ErrorID != 0) {
     logf("[td] instrument query error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
-    qry_error_ = info->ErrorID;
   }
   if (in && (!info || info->ErrorID == 0) &&
       std::strcmp(in->InstrumentID, qry_instrument_symbol_) == 0) {
@@ -115,10 +123,12 @@ inline void TraderClient::OnRspQryInstrument(CThostFtdcInstrumentField* in, CTho
 }
 
 inline void TraderClient::OnRspQryDepthMarketData(CThostFtdcDepthMarketDataField* d, CThostFtdcRspInfoField* info,
-                             int, bool bIsLast) {
+                             int request_id, bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (info && info->ErrorID != 0) {
     logf("[td] depth query error: %d %s\n", info->ErrorID, ctp::gbk_to_utf8(info->ErrorMsg).c_str());
-    qry_error_ = info->ErrorID;
   }
   // The query can return every instrument on some fronts — filter to ours.
   if (d && (!info || info->ErrorID == 0) &&
@@ -133,7 +143,10 @@ inline void TraderClient::OnRspQryDepthMarketData(CThostFtdcDepthMarketDataField
 }
 
 inline void TraderClient::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField* p, CThostFtdcRspInfoField* info,
-                              int, bool bIsLast) {
+                              int request_id, bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (p && (!info || info->ErrorID == 0) && p->Position > 0) {
     PositionRow row{};
     std::snprintf(row.symbol, sizeof(row.symbol), "%s", p->InstrumentID);
@@ -148,8 +161,11 @@ inline void TraderClient::OnRspQryInvestorPosition(CThostFtdcInvestorPositionFie
   if (bIsLast) finish_query();
 }
 
-inline void TraderClient::OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspInfoField* info, int,
+inline void TraderClient::OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspInfoField* info, int request_id,
                    bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (o && (!info || info->ErrorID == 0)) {
     const bool open = o->OrderStatus == THOST_FTDC_OST_PartTradedQueueing ||
                       o->OrderStatus == THOST_FTDC_OST_NoTradeQueueing ||
@@ -185,8 +201,11 @@ inline void TraderClient::OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspIn
   }
 }
 
-inline void TraderClient::OnRspQryTrade(CThostFtdcTradeField* t, CThostFtdcRspInfoField* info, int,
+inline void TraderClient::OnRspQryTrade(CThostFtdcTradeField* t, CThostFtdcRspInfoField* info, int request_id,
                    bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (t && (!info || info->ErrorID == 0)) {
     if (qry_acct_trades_active_) {
       AccountTrade a{};
@@ -207,7 +226,10 @@ inline void TraderClient::OnRspQryTrade(CThostFtdcTradeField* t, CThostFtdcRspIn
 }
 
 inline void TraderClient::OnRspQryTradingAccount(CThostFtdcTradingAccountField* a, CThostFtdcRspInfoField* info,
-                            int, bool bIsLast) {
+                            int request_id, bool bIsLast) {
+  std::lock_guard state_lock(qry_state_mtx_);
+  if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
+  if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (a && (!info || info->ErrorID == 0)) {
     qry_funds_.found = true;
     qry_funds_.balance = a->Balance;
@@ -219,27 +241,36 @@ inline void TraderClient::OnRspQryTradingAccount(CThostFtdcTradingAccountField* 
 }
 
 template <typename SendFn>
-bool TraderClient::run_query(SendFn&& send) {
-  {
-    std::unique_lock lk(qry_state_mtx_);
-    qry_done_ = false;
-    qry_error_ = 0;
-  }
+bool TraderClient::run_query(SendFn&& send, std::chrono::milliseconds timeout) {
   for (int attempt = 0; attempt < 30; ++attempt) {
-    const int ret = send();
-    if (ret == 0) break;
-    // -2/-3: outstanding-request / per-second flow limits — wait and retry.
+    const int request_id = ++req_id_;
+    {
+      std::lock_guard lk(qry_state_mtx_);
+      qry_done_ = false;
+      qry_error_ = 0;
+      qry_request_id_ = request_id;
+    }
+    const int ret = send(request_id);
+    std::unique_lock lk(qry_state_mtx_);
+    if (ret == 0) {
+      const bool done = qry_cv_.wait_for(lk, timeout, [this] { return qry_done_; });
+      qry_request_id_ = 0; // retire before releasing the result to the caller
+      const bool ok = done && qry_error_ == 0;
+      if (!ok) logf("[td] query %d failed (timeout=%d, error=%d)\n",
+                    request_id, !done, qry_error_);
+      return ok;
+    }
+    qry_request_id_ = 0;
+    if (ret != -2 && ret != -3) return false;
+    lk.unlock();
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
   }
-  std::unique_lock lk(qry_state_mtx_);
-  return qry_cv_.wait_for(lk, std::chrono::seconds(10), [this] { return qry_done_; });
+  return false;
 }
 
 inline void TraderClient::finish_query() {
-  {
-    std::lock_guard lk(qry_state_mtx_);
-    qry_done_ = true;
-  }
+  qry_done_ = true;
+  qry_request_id_ = 0;
   qry_cv_.notify_all();
 }
 

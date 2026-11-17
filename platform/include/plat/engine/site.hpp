@@ -170,6 +170,15 @@ class Site {
   // Journaled as Source; replay re-injects them via inject().
   template <PlatMsg T>
   HFT_FORCE_INLINE void source(const T& msg, Nanos ts, Nanos received = 0) {
+    // Record the restrictive state before the triggering event so healthy
+    // journals replay the same risk decisions. Recovery only rebuilds state.
+    if (mode_ == Mode::Live && !recovering_ && !trading_permitted()) {
+      if constexpr (std::is_same_v<T, KillSwitchCmd>) {
+        if (msg.action == KillAction::Disarm) return;
+      } else if (!risk_.kill().halted(0, 0)) {
+        command_kill(KillScope::Site, KillAction::Halt, 0, ts);
+      }
+    }
     const auto begin = latency_.now();
     if constexpr (std::is_same_v<T, MdSnapshotEvt> || std::is_same_v<T, MdOrderEvt> ||
                   std::is_same_v<T, MdTradeEvt> || std::is_same_v<T, FeedGapEvt>)
@@ -194,7 +203,7 @@ class Site {
   [[nodiscard]] PreFlight preflight() const {
     PreFlight p;
     p.instruments = table_->size() > 0 && !cfg_.hosted.empty();
-    p.journal = cfg_.journal_path.empty() || journal_open_;
+    p.journal = trading_permitted();
     p.session_up = gw_ && gw_->state() == SessState::Up;
     p.books = books_attached_;
     p.limits = cfg_.limits.max_order_qty > 0 && cfg_.limits.max_actions_per_sec > 0;
@@ -226,6 +235,10 @@ class Site {
   // monotonic version so a stale/replayed command can never override a newer
   // one (§10.3, review R1).
   void command_kill(KillScope scope, KillAction action, std::uint16_t target, Nanos now) {
+    if (action == KillAction::Disarm && !trading_permitted()) {
+      logf("[site] disarm refused: safety interlock requires repair and restart\n");
+      return;
+    }
     KillSwitchCmd k{};
     k.ts = now;
     k.cmd_seq = risk_.kill().last_cmd_seq() + 1;
@@ -256,10 +269,11 @@ class Site {
   // driver queries open orders and fill aggregates from the counter (CTP
   // ReqQryOrder / ReqQryTrade) and hands them in; the venue is the source of
   // truth and any break blocks the next session's re-enable.
-  void run_eod(const std::vector<VenueOpenOrder>& venue_open, Qty venue_buy, Qty venue_sell) {
+  void run_eod(const std::vector<VenueOpenOrder>& venue_open, Qty venue_buy, Qty venue_sell,
+               bool query_ok = true) {
     eod_.order_breaks = oms_.reconcile(venue_open).size();
     const auto fills = pnl_.reconcile_fills(venue_buy, venue_sell);
-    eod_.fills_ok = fills.ok;
+    eod_.fills_ok = query_ok && fills.ok;
     eod_.venue_buy = venue_buy;
     eod_.venue_sell = venue_sell;
     eod_.ran = true;
@@ -269,7 +283,17 @@ class Site {
   // False once the journal thread was lapped: the audit record has a hole —
   // the driver halts trading on this (fail closed, §7.2).
   [[nodiscard]] bool journal_healthy() const noexcept {
-    return !journal_open_ || journal_.healthy();
+    return mode_ == Mode::Replay || cfg_.journal_path.empty() ||
+           (journal_open_ && journal_.healthy());
+  }
+
+  // Physical safety interlock, independent of the replayed business state.
+  // Operator Disarm cannot clear it; repair/reconcile and restart are required.
+  void block_trading() noexcept { trading_blocked_ = true; go_ = false; }
+  [[nodiscard]] bool safety_blocked() const noexcept { return trading_blocked_; }
+  [[nodiscard]] bool trading_permitted() const noexcept {
+    return !trading_blocked_ && journal_healthy() &&
+           (mode_ == Mode::Replay || cfg_.journal_path.empty() || journal_.is_open());
   }
 
   // --------------------------------------------------------------- recovery
@@ -295,6 +319,9 @@ class Site {
 
   OrderId place(InstrumentId inst, Side side, Offset offset, Price px, Qty qty, Tif tif,
                 Nanos trigger_ts) {
+    if (mode_ == Mode::Live && !recovering_ && !trading_permitted() &&
+        !risk_.kill().halted(0, 0))
+      command_kill(KillScope::Site, KillAction::Halt, 0, cur_ts_);
     const bool paused = strategy_timer_.pause(latency_.now());
     const auto prepare_begin = latency_.now();
     NewOrderReq r{};
@@ -383,6 +410,7 @@ class Site {
   }
 
  private:
+  friend struct SiteTestAccess;
   // Wiring, the dispatch chain, and strategy routing are defined in
   // site_dispatch.hpp; snapshot serialization in site_state.hpp. Both are
   // included at the bottom of this header — never include them directly.
@@ -434,6 +462,7 @@ class Site {
   StreamCore stream_;
   AsyncJournal journal_;
   bool journal_open_ = false;
+  bool trading_blocked_ = false;
 
   Oms oms_;
   PnlLedger pnl_;

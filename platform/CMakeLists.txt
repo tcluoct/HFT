@@ -126,6 +126,8 @@ set(PLATD_HEADERS
   include/plat/ctp/trader_client_orders.hpp
   include/plat/ctp/trader_client_queries.hpp
   include/plat/engine/live.hpp
+  include/plat/engine/reconcile.hpp
+  include/plat/engine/session_marker.hpp
   include/plat/engine/report.hpp
   include/plat/replay/replayer.hpp
   include/plat/replay/sidecar.hpp
@@ -302,9 +304,13 @@ set_target_properties(platd PROPERTIES
 # desk/).
 add_executable(plat_tests
   src/tests_main.cpp src/tests_util.hpp src/tests_components.cpp src/tests_risk.cpp src/tests_engine.cpp
-  src/tests_recorder.cpp src/tests_signals.cpp src/tests_ops.cpp)
+  src/tests_recorder.cpp src/tests_signals.cpp src/tests_ops.cpp src/tests_safety.cpp)
 hft_configure(plat_tests)
-target_link_libraries(plat_tests PRIVATE desk)
+target_link_libraries(plat_tests PRIVATE desk ${CTP_LIBS})
+foreach(dll ${CTP_DLLS})
+  add_custom_command(TARGET plat_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${dll} $<TARGET_FILE_DIR:plat_tests>)
+endforeach()
 
 # plat_bench — hot-path budget lines through the production dispatch chain
 # (synthetic input, capture gateway; no simulation, no CTP linkage). Uses the

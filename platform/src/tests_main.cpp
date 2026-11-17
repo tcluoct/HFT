@@ -50,6 +50,11 @@ void test_ops_manual_order_cancel();
 void test_ops_position_transfer();
 void test_ops_mirror();
 void test_ops_journal_tailer();
+// tests_safety.cpp
+void test_query_fail_closed();
+void test_safety_interlocks();
+void test_recovery_counter_audit();
+void test_session_marker();
 
 int main() {
   plat::install_crash_handlers("plat_tests");
@@ -91,6 +96,10 @@ int main() {
   test_ops_position_transfer();
   test_ops_mirror();
   test_ops_journal_tailer();
+  test_query_fail_closed();
+  test_safety_interlocks();
+  test_recovery_counter_audit();
+  test_session_marker();
   std::printf("plat_tests: %d checks, %d failures\n", g_checks, g_fails);
   return g_fails == 0 ? 0 : 1;
 }

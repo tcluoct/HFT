@@ -139,6 +139,12 @@ class Oms {
 
   [[nodiscard]] std::size_t total_orders() const noexcept { return orders_.size(); }
 
+  // Cold recovery audit includes terminal orders, not just the live index.
+  template <typename Fn>
+  void for_each(Fn&& fn) const {
+    for (const auto& [id, order] : orders_) fn(order);
+  }
+
   struct Break {
     OrderId cl_id;
     std::uint64_t venue_no;

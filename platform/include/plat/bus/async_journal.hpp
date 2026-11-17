@@ -102,7 +102,8 @@ class AsyncJournal {
       if (fault_.load(std::memory_order_acquire)) {
         jw_.abandon();  // leave the header unsealed; keep the bytes for post-mortem
       } else {
-        jw_.close();  // seals (count + running hash) and syncs
+        if (!jw_.seal()) fault_.store(true, std::memory_order_release);
+        jw_.abandon(); // seal was checked above; close without another attempt
       }
     }
     open_ = false;
