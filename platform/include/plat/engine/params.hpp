@@ -9,6 +9,7 @@
 // strategy teams exist. Key blocks are documented in platd.example.cfg.
 
 #include <cstdint>
+#include <stdexcept>
 
 #include "plat/core/config.hpp"
 #include "plat/core/time.hpp"
@@ -45,6 +46,16 @@ inline RiskLimits limits_from(const Config& c) {
   l.st_daily_buy_qty = c.i64("risk.st_daily_buy_qty", 500'000);
   l.max_stock_holding_qty = c.i64("risk.max_stock_holding_qty", 0);
   l.max_stock_holding_e4 = px_from_cny(c.f64("risk.max_stock_holding_cny", 0.0));
+  const std::string width = c.str("risk.auction_max_deviation_bps", "0");
+  std::size_t consumed = 0;
+  const auto bps = std::stoll(width, &consumed);
+  if (consumed != width.size() || bps < 0 || bps > 10'000)
+    throw std::invalid_argument("risk.auction_max_deviation_bps must be an integer in [0, 10000]");
+  l.auction_max_deviation_bps = static_cast<std::uint32_t>(bps);
+  const auto ref = c.str("risk.auction_reference", "session_reference");
+  if (ref == "session_reference") l.auction_reference = AuctionReference::SessionReference;
+  else if (ref == "last_trade") l.auction_reference = AuctionReference::LastTrade;
+  else throw std::invalid_argument("risk.auction_reference must be session_reference or last_trade");
   return l;
 }
 

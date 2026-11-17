@@ -44,6 +44,9 @@ constexpr bool phase_accepts_cancels(Phase p) noexcept {
 }
 // Only continuous phases match on arrival; auctions match at phase end.
 constexpr bool phase_matches_continuously(Phase p) noexcept { return p == Phase::Continuous; }
+constexpr bool phase_is_auction(Phase p) noexcept {
+  return p == Phase::OpenAuction || p == Phase::OpenAuctionLocked || p == Phase::CloseAuction;
+}
 
 // A day's phase timetable: ordered transition list. Fixed capacity — this is
 // reference data, loaded at start of day (§9.6), never grown intraday.

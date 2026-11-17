@@ -14,6 +14,8 @@
 
 namespace plat {
 
+enum class AuctionReference : std::uint8_t { SessionReference, LastTrade };
+
 struct RiskLimits {
   Qty max_order_qty = 10'000;           // futures lots per order (#3)
   Qty max_stock_order_qty = 100'000;    // shares per stock order (#3); the board max (#17) also applies
@@ -72,7 +74,18 @@ struct RiskLimits {
   //     fund contract. 0 = off.
   Qty max_stock_holding_qty = 0;
   std::int64_t max_stock_holding_e4 = 0;
+
+  // Firm auction collar, not an exchange-wide regulatory constant.
+  // Zero blocks auction submissions until an approved band is configured.
+  std::uint32_t auction_max_deviation_bps = 0;
+  AuctionReference auction_reference = AuctionReference::SessionReference;
 };
+
+constexpr bool valid_auction_limits(const RiskLimits& l) noexcept {
+  return l.auction_max_deviation_bps <= 10'000 &&
+         (l.auction_reference == AuctionReference::SessionReference ||
+          l.auction_reference == AuctionReference::LastTrade);
+}
 
 // Live risk-limit update (operator `reload`, §10.1). Journaled as a SOURCE
 // envelope so replay re-applies exactly the limits that were in force; the
@@ -120,6 +133,8 @@ inline void mix_limits(StateHash& h, const RiskLimits& l) {
   h.mix(l.st_daily_buy_qty);
   h.mix(l.max_stock_holding_qty);
   h.mix(l.max_stock_holding_e4);
+  h.mix(l.auction_max_deviation_bps);
+  h.mix(l.auction_reference);
 }
 
 // check_new/check_cancel return this when every check passes.

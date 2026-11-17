@@ -41,6 +41,7 @@
 #include "plat/risk/limits.hpp"
 #include "plat/risk/session_guard.hpp"
 #include "plat/risk/stock_rules.hpp"
+#include "plat/risk/auction_rules.hpp"
 #include "plat/pnl/pnl.hpp"
 #include "plat/ref/instrument.hpp"
 
@@ -68,7 +69,7 @@ class RiskGate {
   // else applies immediately. Returns false and leaves the gate unchanged on
   // a rejected update.
   bool set_limits(const RiskLimits& l) {
-    if (l.max_order_qty <= 0 || l.max_actions_per_sec == 0 ||
+    if (!valid_auction_limits(l) || l.max_order_qty <= 0 || l.max_actions_per_sec == 0 ||
         l.max_actions_per_sec != limits_.max_actions_per_sec)
       return false;  // invalid, or rate-ring resize (restart-only)
     limits_ = l;
@@ -106,6 +107,20 @@ class RiskGate {
     // with limit orders, and pretending otherwise would hide the exposure.
     if (!phase_accepts_orders(phase_[static_cast<std::size_t>(in.venue)]))
       return RiskCheck::PhaseGate;
+
+    // A dedicated auction collar applies to both directions and to emergency
+    // closes too. Existing exchange limits, freshness and tick checks still apply.
+    if (phase_is_auction(phase_[static_cast<std::size_t>(in.venue)])) {
+      Price ref = 0;
+      if (limits_.auction_reference == AuctionReference::SessionReference) {
+        ref = in.prev_close; // live CTP master: previous settlement, else previous close
+      } else if (limits_.auction_reference == AuctionReference::LastTrade) {
+        if (const FutBook* b = fut_books_[r.inst]; b && b->valid()) ref = b->snap().last_px;
+        else if (const StockBook* b = stock_books_[r.inst]) ref = b->top().last_px;
+      }
+      if (!auction_price_ok(r.px, ref, limits_.auction_max_deviation_bps))
+        return RiskCheck::AuctionDeviation;
+    }
 
     // 11) Stale-data interlock: refuse to trade a quarantined or aged book.
     if (!book_fresh(r.inst, now)) return RiskCheck::StaleData;
@@ -318,6 +333,8 @@ class RiskGate {
     append(out, limits_.st_daily_buy_qty);
     append(out, limits_.max_stock_holding_qty);
     append(out, limits_.max_stock_holding_e4);
+    append(out, limits_.auction_max_deviation_bps);
+    append(out, limits_.auction_reference);
   }
   std::size_t load(const std::uint8_t* p, std::size_t avail) {
     counters_.clear();
@@ -369,7 +386,9 @@ class RiskGate {
     off = read(p, off, avail, limits_.stock_cage_etf);
     off = read(p, off, avail, limits_.st_daily_buy_qty);
     off = read(p, off, avail, limits_.max_stock_holding_qty);
-    return read(p, off, avail, limits_.max_stock_holding_e4);
+    off = read(p, off, avail, limits_.max_stock_holding_e4);
+    off = read(p, off, avail, limits_.auction_max_deviation_bps);
+    return read(p, off, avail, limits_.auction_reference);
   }
 
  private:

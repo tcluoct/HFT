@@ -236,9 +236,10 @@ enum class RiskCheck : std::uint8_t {
   PriceCage,       // 价格笼子: outside base ±2% (or ±10 ticks) in continuous auction
   StBuyLimit,      // 风险警示股票: daily buys per account per stock (50万股)
   Concentration,   // per-account single-stock holding cap (shares / notional)
+  AuctionDeviation, // auction order outside configured reference-price band
 };
 // Last enumerator — sizes per-check counter tables and report loops.
-inline constexpr RiskCheck kRiskCheckLast = RiskCheck::Concentration;
+inline constexpr RiskCheck kRiskCheckLast = RiskCheck::AuctionDeviation;
 
 // Cold-path only (operator console, EOD report) — never called from dispatch.
 constexpr const char* risk_check_name(RiskCheck c) noexcept {
@@ -264,6 +265,7 @@ constexpr const char* risk_check_name(RiskCheck c) noexcept {
     case RiskCheck::PriceCage: return "cage";
     case RiskCheck::StBuyLimit: return "st-buy";
     case RiskCheck::Concentration: return "concentration";
+    case RiskCheck::AuctionDeviation: return "auction-deviation";
     default: return "-";
   }
 }
