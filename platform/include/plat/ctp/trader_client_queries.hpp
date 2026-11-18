@@ -167,9 +167,10 @@ inline void TraderClient::OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspIn
   if (request_id != qry_request_id_ || qry_request_id_ == 0) return;
   if (info && info->ErrorID) qry_error_ = info->ErrorID;
   if (o && (!info || info->ErrorID == 0)) {
-    const bool open = o->OrderStatus == THOST_FTDC_OST_PartTradedQueueing ||
-                      o->OrderStatus == THOST_FTDC_OST_NoTradeQueueing ||
-                      o->OrderStatus == THOST_FTDC_OST_Unknown;
+    const bool open = o->OrderStatus != THOST_FTDC_OST_AllTraded &&
+                      o->OrderStatus != THOST_FTDC_OST_Canceled &&
+                      o->OrderStatus != THOST_FTDC_OST_PartTradedNotQueueing &&
+                      o->OrderStatus != THOST_FTDC_OST_NoTradeNotQueueing;
     if (open && qry_acct_open_active_) {
       AccountOpenOrder a{};
       a.ref_seq = seq_from_order_ref(o->OrderRef);
@@ -189,7 +190,13 @@ inline void TraderClient::OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspIn
         v.leaves = o->VolumeTotal;
         qry_open_orders_.push_back(v);
       } else {
-        ++qry_foreign_open_;  // reported, not flagged: another session's order
+        ++qry_foreign_open_;
+        for (const auto& wire : wires_) {
+          if (std::strcmp(wire.symbol, o->InstrumentID) != 0) continue;
+          qry_open_orders_.push_back({kNoOrder, venue_no_from_sys_id(o->OrderSysID),
+                                      o->VolumeTotal});
+          break;
+        }
       }
     }
   }
@@ -209,6 +216,7 @@ inline void TraderClient::OnRspQryTrade(CThostFtdcTradeField* t, CThostFtdcRspIn
   if (t && (!info || info->ErrorID == 0)) {
     if (qry_acct_trades_active_) {
       AccountTrade a{};
+      a.execution_id = t->TradeID;
       a.venue_no = venue_no_from_sys_id(t->OrderSysID);
       a.ref_seq = seq_from_order_ref(t->OrderRef);
       a.px = px_from_ctp(t->Price);

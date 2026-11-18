@@ -57,7 +57,7 @@ inline std::uint64_t config_fingerprint(const std::vector<StratSpec>& specs,
                                         const InstrumentTable& table,
                                         const std::vector<InstrumentId>& hosted,
                                         std::uint32_t max_actions_per_sec,
-                                        bool shared_account_risk = false) {
+                                        bool isolated_workers = false) {
   StateHash h;
   h.mix(specs.size());
   for (const auto& s : specs) {
@@ -67,7 +67,8 @@ inline std::uint64_t config_fingerprint(const std::vector<StratSpec>& specs,
     h.mix(s.account);
   }
   h.mix(max_actions_per_sec);
-  if (shared_account_risk) h.mix(1u);
+  h.mix(2u);
+  h.mix(isolated_workers);
   h.mix(fees.stock_commission_bps);
   h.mix(fees.stamp_duty_sell_bps);
   h.mix(fees.transfer_fee_bps);

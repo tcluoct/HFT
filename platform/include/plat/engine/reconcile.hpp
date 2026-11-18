@@ -75,9 +75,24 @@ bool reconcile_resume(SiteT& site, TraderT& trader, const InstrumentTable& table
       // Fills the dead process never saw: venue trades beyond our cum.
       Qty applied = o->cum;
       Qty skip = o->cum;
+      std::set<std::string> executions;
+      Qty broker_quantity = 0;
+      for (const auto& trade : *acct_trades) {
+        if (!is_ours_row(trade.venue_no, trade.symbol)) continue;
+        if (trade.execution_id.empty() || !executions.insert(trade.execution_id).second ||
+            trade.qty <= 0 || trade.qty > o->qty - broker_quantity) {
+          site.block_trading();
+          return false;
+        }
+        broker_quantity += trade.qty;
+      }
       const ctp::AccountOpenOrder* live_row = nullptr;
       for (const auto& a : *acct_open)
         if (is_ours_row(a.venue_no, a.symbol)) live_row = &a;
+      if (broker_quantity < o->cum || (live_row && live_row->leaves != o->qty - broker_quantity)) {
+        site.block_trading();
+        return false;
+      }
 
       for (const auto& t : *acct_trades) {
         if (!is_ours_row(t.venue_no, t.symbol)) continue;
@@ -111,7 +126,7 @@ bool reconcile_resume(SiteT& site, TraderT& trader, const InstrumentTable& table
       if (live_row) {
         trader.adopt_order(o->cl_id, inst, o->strategy, o->account, o->side, o->offset,
                            o->px, o->qty, applied, in.symbol, live_row->exchange,
-                           live_row->sys_id);
+                           live_row->sys_id, std::move(executions));
         ++adopted;
       } else {
         // The venue no longer knows it (canceled/expired while dead, or it

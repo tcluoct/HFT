@@ -3,6 +3,7 @@
 #include <thread>
 
 #include "tests_util.hpp"
+#include "platd_app.hpp"
 #include "plat/ctp/trader_client.hpp"
 #include "plat/engine/reconcile.hpp"
 #include "plat/engine/session_marker.hpp"
@@ -65,14 +66,20 @@ void test_trade_ring_transport() {
   ctp::TraderClientTestAccess::set_state(client, SessState::Up);
   const OrderId cl_id = make_order_id(1, 17);
   client.adopt_order(cl_id, 0, 4, 7, Side::Buy, Offset::Open, px_from_cny(78'000),
-                     3, 0, "cu2701", "SHFE", "12345");
+                     4, 1, "cu2701", "SHFE", "12345", {"1000"});
   CThostFtdcTradeField fill{};
   ctp::order_ref_from_seq(17, fill.OrderRef);
   std::memcpy(fill.OrderSysID, "12345", sizeof("12345"));
+  std::memcpy(fill.ExchangeID, "SHFE", sizeof("SHFE"));
+  std::memcpy(fill.TradeID, "1000", sizeof("1000"));
   fill.Price = 78'010.0;
   fill.Volume = 2;
   fill.OffsetFlag = THOST_FTDC_OF_Open;
   client.OnRtnTrade(&fill);
+  std::memcpy(fill.TradeID, "1001", sizeof("1001"));
+  client.OnRtnTrade(&fill);
+  client.OnRtnTrade(&fill);
+  std::memcpy(fill.TradeID, "1002", sizeof("1002"));
   fill.Volume = 1;
   client.OnRtnTrade(&fill);
 
@@ -85,12 +92,12 @@ void test_trade_ring_transport() {
     const auto& report = event.report;
     CHECK(report.type == ExecType::Fill && report.cl_id == cl_id);
     CHECK(report.account == 7 && report.strategy == 4 && report.inst == 0);
-    CHECK(report.qty == 2 && report.cum == 2 && report.leaves == 1);
+    CHECK(report.qty == 2 && report.cum == 3 && report.leaves == 1);
     CHECK(report.ts == 123 && report.px == px_from_cny(fill.Price));
   }
   CHECK(ring.poll(event) == TradeRing::Poll::Event && event.kind == TradeEvent::Kind::Report);
   if (event.kind == TradeEvent::Kind::Report)
-    CHECK(event.report.qty == 1 && event.report.cum == 3 && event.report.leaves == 0);
+    CHECK(event.report.qty == 1 && event.report.cum == 4 && event.report.leaves == 0);
   CHECK(ring.poll(event) == TradeRing::Poll::Empty);
 
   const TradeEvent session{SessionStateEvt{123, Venue::SHFE, SessState::Up}};
@@ -100,6 +107,13 @@ void test_trade_ring_transport() {
   ring.publish(session);  // overflow invalidates the stream
   CHECK(ring.poll(event) == TradeRing::Poll::Fault);
   CHECK(ring.poll(event) == TradeRing::Poll::Fault);
+  TradeRing malformed;
+  ctp::TraderClient invalid_client({}, malformed, +[]() -> Nanos { return 123; });
+  invalid_client.adopt_order(cl_id, 0, 4, 7, Side::Buy, Offset::Open, px_from_cny(78'000),
+                             1, 0, "cu2701", "SHFE", "12345");
+  fill.Volume = 2;
+  invalid_client.OnRtnTrade(&fill);
+  CHECK(malformed.poll(event) == TradeRing::Poll::Fault);
 }
 
 void test_query_fail_closed() {
@@ -263,6 +277,8 @@ void test_recovery_counter_audit() {
   counter.orders->push_back(unknown);
   CHECK(reconcile_resume(*known, counter, table, at_time(9, 0)));
   CHECK(counter.adopted == 1 && !known->safety_blocked());
+  known->run_eod({VenueOpenOrder{id, 123, 1}}, 0, 0);
+  CHECK(known->eod().order_breaks == 0 && !known->eod().clean());
 
   // Reused OrderRef alone cannot establish which crashed session owned it.
   auto unacked = make_site();
@@ -280,6 +296,20 @@ void test_recovery_counter_audit() {
 }
 
 void test_session_marker() {
+  Config fleet;
+  fleet.set_default("user_id", "desk");
+  fleet.set_default("shard1.instruments", "cu, rb");
+  fleet.set_default("shard2.instruments", "rb");
+  CHECK(!platcfg::unique_fleet_instruments(fleet));
+  fleet.set_default("shard2.investor_id", "second");
+  CHECK(platcfg::unique_fleet_instruments(fleet));
+  Config lineup;
+  lineup.set_default("strategies", "first");
+  lineup.set_default("first.type", "momentum");
+  lineup.set_default("first.id", "2");
+  lineup.set_default("first.account", "2");
+  std::vector<StratSpec> specs;
+  CHECK(!platd::parse_live_strategies(lineup, 1, specs));
   const std::string path = "safety_test.eod-breaks";
   std::filesystem::remove(path);
   SessionMarker first(path);
@@ -308,4 +338,23 @@ void test_session_marker() {
   if (hold != INVALID_HANDLE_VALUE) CloseHandle(hold);
   CHECK(locked.complete(true));
 #endif
+}
+
+void test_carry_attribution() {
+  auto table = one_future();
+  platd::LiveSite site(table, config(), platd::LiveSite::Mode::Replay, desk::Pack::Banks{});
+  PositionsRow owner{};
+  owner.strategy = 2;
+  owner.long_lots = 2;
+  ctp::PositionRow broker{};
+  std::snprintf(owner.symbol, sizeof(owner.symbol), "%s", table.at(0).symbol);
+  std::snprintf(broker.symbol, sizeof(broker.symbol), "%s", owner.symbol);
+  broker.is_long = true;
+  broker.total = broker.yd = 1;
+  const auto now = at_time(9, 0);
+  CHECK(platd::apply_carry(site, table, 1, {owner}, {broker, broker}, now));
+  CHECK(site.pnl().at(1, 2, 0).long_yd == 2);
+  CHECK(!platd::apply_carry(site, table, 1, {}, {broker}, now));
+  CHECK(site.pnl().at(1, 0, 0).long_yd == 1 && site.pnl().at(1, 2, 0).long_yd == 2);
+  CHECK(!platd::apply_carry(site, table, 1, {owner}, {}, now));
 }

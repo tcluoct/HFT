@@ -101,7 +101,9 @@ inline void TraderClient::cancel(const CancelReq& c) {
       bounce_cancel(c, ExecReason::UnknownOrder);
       return;
     }
-    snapshot = it->second;
+    std::memcpy(snapshot.symbol, it->second.symbol, sizeof(snapshot.symbol));
+    std::memcpy(snapshot.exchange, it->second.exchange, sizeof(snapshot.exchange));
+    std::memcpy(snapshot.sys_id, it->second.sys_id, sizeof(snapshot.sys_id));
   }
 
   CThostFtdcInputOrderActionField f{};
@@ -130,7 +132,8 @@ inline void TraderClient::add_instrument(InstrumentId id, const char* symbol, co
 
 inline void TraderClient::adopt_order(OrderId cl_id, InstrumentId inst, StrategyId strategy, AccountId account,
                  Side side, Offset offset, Price px, Qty qty, Qty cum,
-                 const char* symbol, const char* exchange, const char* sys_id) {
+                 const char* symbol, const char* exchange, const char* sys_id,
+                 std::set<std::string> executions) {
   const std::uint64_t seq = cl_id & 0xFFFF'FFFF'FFFFull;
   OrderCtx ctx{};
   ctx.cl_id = cl_id;
@@ -144,6 +147,7 @@ inline void TraderClient::adopt_order(OrderId cl_id, InstrumentId inst, Strategy
   ctx.cum = cum;
   ctx.acked = true;
   ctx.adopted = true;
+  ctx.executions = std::move(executions);
   ctx.venue_no = venue_no_from_sys_id(sys_id);
   std::snprintf(ctx.sys_id, sizeof(ctx.sys_id), "%s", sys_id);
   std::snprintf(ctx.symbol, sizeof(ctx.symbol), "%s", symbol);
@@ -304,9 +308,17 @@ inline void TraderClient::OnRtnTrade(CThostFtdcTradeField* t) {
   // session reuses — another shard's trade with the same ref number MUST
   // NOT credit our order. Fills only ever follow our ack (or an adoption),
   // both of which recorded the venue-unique OrderSysID: require the match.
-  if (!ctx.acked || ctx.sys_id[0] == '\0' ||
+  if (!ctx.acked || ctx.sys_id[0] == '\0' || std::strcmp(ctx.exchange, t->ExchangeID) != 0 ||
       std::strcmp(ctx.sys_id, t->OrderSysID) != 0)
     return;
+  if (t->TradeID[0] && ctx.executions.contains(t->TradeID)) return;
+  if (!t->TradeID[0] || t->Volume <= 0 || t->Volume > ctx.qty - ctx.cum) {
+    logf("[td] invalid execution identity or volume for order %llu; blocking trading\n",
+         static_cast<unsigned long long>(ctx.cl_id));
+    trade_ring_.fault();
+    return;
+  }
+  ctx.executions.emplace(t->TradeID);
   ctx.cum += t->Volume;
   const Qty leaves = ctx.qty - ctx.cum;
   ExecReport r = make_report(ctx, ExecType::Fill, px_from_ctp(t->Price), t->Volume,
@@ -327,6 +339,7 @@ inline [[nodiscard]] bool TraderClient::trade_is_ours(const CThostFtdcTradeField
   std::lock_guard lk(reg_mtx_);
   const auto it = orders_.find(seq);
   return it != orders_.end() && it->second.sys_id[0] != '\0' &&
+         std::strcmp(it->second.exchange, t->ExchangeID) == 0 &&
          std::strcmp(it->second.sys_id, t->OrderSysID) == 0;
 }
 

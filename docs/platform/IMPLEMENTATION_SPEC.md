@@ -76,7 +76,7 @@ Build the account engine as `AccountEngine<Counter>`. Extend the existing `Order
 
 | Condition | Required behavior |
 | --- | --- |
-| Strategy hangs or exits | Alert on lack of callback progress or process exit. Fence the old runner generation against further automatic intents. Continue processing its fills and serving healthy runners. Leave resting orders and positions for manual handling. A restarted runner loads a fresh baseline before it can submit. |
+| Strategy hangs or exits | Fence the runner and halt its strategy. The account engine cancels that strategy’s resting orders, monitors them until terminal, and continues processing fills and serving healthy runners. Leave positions for manual handling; do not automatically flatten. A restarted runner loads a fresh baseline before it can submit. |
 | A runner falls behind or fills its queue | Surface the overflow to the affected runner and operations. After a feed or execution-report gap, suspend new intents from that runner until it resynchronizes. Leave the feed publisher and account engine independent of the runner's progress. |
 | Account engine loses market data, counter reports, or journal integrity | Suspend new order entry when the affected risk state is untrustworthy. Rebuild the feed baseline or reconcile account state as applicable. Restore order entry only after the failed dependency is healthy and state is verified. |
 | Account engine or counter session restarts | Start with order entry disabled. Restore the journal and snapshot, query current broker state, merge and deduplicate reports, reconcile outstanding submissions and reservations, then reopen. An ambiguous submission is never automatically resent. |
@@ -93,7 +93,7 @@ Preallocate and warm shared-memory queues and hot state. Pin feed and execution 
 
 | Test | Pass condition |
 | --- | --- |
-| Isolation | Deliberately hang one of two live runners. The other keeps receiving ticks, submitting orders, and receiving fills. Operations sees the stall. The hung runner's resting orders stay under manual control. |
+| Isolation | Deliberately hang one of two live runners. The other keeps receiving ticks, submitting orders, and receiving fills. Operations sees the stall and verifies cancellation of the hung runner’s resting orders at the broker. |
 | Shared limit | Two runners submit orders competing for the last available capacity. Only capacity permitted by account rules is reserved and sent. Working orders, pending cancels, partial fills, and rejects update capacity correctly. |
 | Manual intervention | Submit, fill, and cancel through the broker terminal, including a manual cancel of a strategy order. Verify working exposure and attribution, external ID collisions, duplicate reports, and account-wide reconciliation. |
 | Recovery and access | Force feed gaps, runner overflow, disconnects, and crashes around submission. Verify replay and recovery. A PM cannot retrieve another PM's records via UI, API, or streams. |

@@ -49,6 +49,11 @@ int main(int argc, char** argv) {
     plat::Config fleet;
     if (!load_or_die(fleet, argv[3])) return 1;
     const int n = std::atoi(argv[2]);
+    if (!unique_fleet_instruments(fleet) || n < 1 || n > 32 ||
+        !fleet.has("shard" + std::to_string(n) + ".instruments")) {
+      plat::logf("[platd] invalid shard or duplicate broker account/instrument ownership\n");
+      return 1;
+    }
     const bool resume = argc >= 5 && std::strcmp(argv[4], "--resume") == 0;
     plat::logf("[platd] running as shard %d of %s%s\n", n, argv[3],
                resume ? " (FORCED RESUME)" : "");

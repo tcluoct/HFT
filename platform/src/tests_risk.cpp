@@ -331,6 +331,10 @@ void test_stock_gate() {
     CHECK(rig.send(rig.req(0, 9.40, 100)) == kRiskPass);
     // Auctions have no cage (the limit band still binds).
     rig.gate->set_phase(Venue::SSE, Phase::OpenAuction);
+    CHECK(rig.send(rig.req(0, 10.50, 100)) == RiskCheck::AuctionDeviation);
+    auto auction_limits = rig.gate->limits();
+    auction_limits.auction_max_deviation_bps = 1500;
+    CHECK(rig.gate->set_limits(auction_limits));
     CHECK(rig.send(rig.req(0, 10.50, 100)) == kRiskPass);
     CHECK(rig.send(rig.req(0, 11.10, 100)) == RiskCheck::PriceCollar);
   }

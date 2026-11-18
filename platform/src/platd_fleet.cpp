@@ -193,6 +193,10 @@ int run_fleet(const std::string& cfg_path) {
     return 1;
   }
   const std::vector<int> ids = fleet_shard_ids(fleet);
+  if (!unique_fleet_instruments(fleet)) {
+    logf("[fleet] duplicate broker account/instrument ownership\n");
+    return 1;
+  }
   if (ids.empty()) {
     logf("fleet config has no `shardN.instruments` sections\n");
     return 1;

@@ -5,6 +5,8 @@
 // the two can never disagree about which journal/cmd file a shard uses.
 
 #include <string>
+#include <set>
+#include <tuple>
 #include <vector>
 
 #include "plat/core/config.hpp"
@@ -31,6 +33,17 @@ inline std::vector<int> fleet_shard_ids(const plat::Config& fleet) {
   for (int n = 1; n <= 32; ++n)
     if (fleet.has("shard" + std::to_string(n) + ".instruments")) ids.push_back(n);
   return ids;
+}
+
+inline bool unique_fleet_instruments(const plat::Config& fleet) {
+  std::set<std::tuple<std::string, std::string, std::string>> owners;
+  for (const int number : fleet_shard_ids(fleet)) {
+    const auto cfg = shard_config(fleet, number);
+    for (const auto& symbol : cfg.list("instruments"))
+      if (!owners.emplace(cfg.str("broker_id"), cfg.str("investor_id", cfg.str("user_id")),
+                          symbol).second) return false;
+  }
+  return true;
 }
 
 }  // namespace platcfg

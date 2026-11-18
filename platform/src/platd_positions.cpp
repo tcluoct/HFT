@@ -5,8 +5,7 @@
 // `<journal>.positions`; the next fresh start reads yesterday's file and
 // distributes the counter's carried totals per strategy. The counter is
 // the authority on quantity — any attribution mismatch is logged loudly and
-// the unattributed remainder falls back to the momentum book, exactly the
-// pre-file behavior.
+// unattributed carry locks trading pending reconciliation.
 
 #include <cstring>
 #include <string>
@@ -25,7 +24,7 @@ namespace platd {
 // carry-in per strategy. This walks the LEDGER, not the configured strategy
 // list: a stopped strategy's carried lots must keep flowing through the
 // .positions chain until it is re-enabled or flattened.
-void write_eod_positions(LiveSite& site, const InstrumentTable& table,
+bool write_eod_positions(LiveSite& site, const InstrumentTable& table,
                          const std::string& jnl_path) {
   std::vector<PositionsRow> rows;
   site.pnl().for_each([&](const PosKey& k, const Position& p) {
@@ -38,9 +37,11 @@ void write_eod_positions(LiveSite& site, const InstrumentTable& table,
     r.short_cost_e4 = p.short_cost_e4;
     if (r.long_lots > 0 || r.short_lots > 0) rows.push_back(r);
   });
-  if (save_positions(jnl_path + ".positions", site.config().day, rows))
-    logf("[platd] EOD positions written: %zu attributed rows -> %s.positions\n", rows.size(),
-         jnl_path.c_str());
+  if (!save_positions(jnl_path + ".positions", site.config().day, rows)) {
+    logf("[platd] failed to persist EOD attribution: %s.positions\n", jnl_path.c_str());
+    return false;
+  }
+  return true;
 }
 
 // Read yesterday's attribution (called BEFORE the sealed journal is
@@ -85,22 +86,27 @@ void source_carry_in(LiveSite& site, Nanos ts, AccountId account, StrategyId str
 // rows are honored only while they fit inside the counter totals — including
 // rows for strategies that are stopped this session (their book just sits,
 // marked and margined, until re-enabled). Any remainder — manual trades, a
-// lost file, another terminal on the account — lands on the first configured
-// instance's book with a loud warning (id 0 = unattributed if none run).
+// lost file, another terminal on the account — blocks trading.
 bool carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
                         const InstrumentTable& table, AccountId account,
-                        const std::vector<PositionsRow>& prev,
-                        const std::vector<StratSpec>& specs, Nanos ts) {
-  const StrategyId fallback = specs.empty() ? StrategyId{0} : specs.front().id;
-  const auto account_for = [&](StrategyId sid) {
-    for (const auto& s : specs)
-      if (s.id == sid) return s.account;
-    return account;
-  };
+                        const std::vector<PositionsRow>& prev, Nanos ts) {
   const auto positions = trader.query_positions();
   if (!positions) return false;
+  const auto open_orders = trader.query_account_open_orders();
+  if (!open_orders) return false;
+  for (const auto& order : *open_orders)
+    if (table.find(order.symbol) != kNoInstrument) {
+      logf("[platd] unmanaged open order on %s at fresh start; trading locked\n", order.symbol);
+      return false;
+    }
+  return apply_carry(site, table, account, prev, *positions, ts);
+}
+
+bool apply_carry(LiveSite& site, const InstrumentTable& table, AccountId account,
+                 std::vector<PositionsRow> unallocated,
+                 const std::vector<ctp::PositionRow>& positions, Nanos ts) {
   bool complete = true;
-  for (const auto& p : *positions) {
+  for (const auto& p : positions) {
     const InstrumentId id = table.find(p.symbol);
     if (id == kNoInstrument) continue;  // position in an unhosted instrument
     const Instrument& in = table.at(id);
@@ -111,39 +117,30 @@ bool carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
 
     // Hand out this (instrument, direction)'s carried lots per attribution.
     Qty remaining = p.yd;
-    for (const auto& r : prev) {
+    for (auto& r : unallocated) {
       if (in.sym() != r.symbol) continue;
-      const Qty lots = p.is_long ? r.long_lots : r.short_lots;
+      Qty& lots = p.is_long ? r.long_lots : r.short_lots;
       if (lots <= 0) continue;
       const Qty take = lots < remaining ? lots : remaining;
       if (take <= 0) break;
       const Price cost = p.is_long ? r.long_cost_e4 : r.short_cost_e4;
-      source_carry_in(site, ts, account_for(r.strategy), r.strategy, id, 0,
+      source_carry_in(site, ts, account, r.strategy, id, 0,
                       p.is_long ? take : 0, p.is_long ? 0 : take,
                       cost ? cost : counter_cost);
       logf("[platd] carry-in %s %s yd %lld -> strategy %u (cost %.1f)\n", p.symbol,
            p.is_long ? "long" : "short", static_cast<long long>(take), r.strategy,
            px_to_cny(cost ? cost : counter_cost));
       remaining -= take;
-      if (lots > take)
-        logf("[platd] WARNING: %s attribution for strategy %u exceeds counter carry "
-             "(%lld > available) — trimmed to the counter's truth\n",
-             p.symbol, r.strategy, static_cast<long long>(lots));
+      lots -= take;
     }
 
     if (remaining > 0) {
       // Unattributed carry: manual trades or a missing/stale file.
-      source_carry_in(site, ts, account_for(fallback), fallback, id, 0,
+      complete = false;
+      source_carry_in(site, ts, account, 0, id, 0,
                       p.is_long ? remaining : 0, p.is_long ? 0 : remaining, counter_cost);
-      if (!prev.empty())
-        logf("[platd] WARNING: %s %s has %lld unattributed carried lots — assigned to "
-             "strategy %u; review yesterday's .positions file\n",
-             p.symbol, p.is_long ? "long" : "short", static_cast<long long>(remaining),
-             fallback);
-      else
-        logf("[platd] carry-in %s %s yd %lld -> strategy %u (no attribution file)\n",
-             p.symbol, p.is_long ? "long" : "short", static_cast<long long>(remaining),
-             fallback);
+      logf("[platd] %s has %lld unattributed lots; trading locked\n",
+           p.symbol, static_cast<long long>(remaining));
     }
 
     if (p.total != p.yd) {
@@ -153,6 +150,12 @@ bool carry_in_positions(LiveSite& site, ctp::TraderClient& trader,
            p.symbol, static_cast<long long>(p.total - p.yd));
     }
   }
+  for (const auto& row : unallocated)
+    if (row.long_lots || row.short_lots) {
+      logf("[platd] unmatched attribution for %s strategy %u; trading locked\n",
+           row.symbol, row.strategy);
+      complete = false;
+    }
   return complete;
 }
 

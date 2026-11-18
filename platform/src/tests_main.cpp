@@ -61,6 +61,7 @@ void test_trade_ring_transport();
 void test_safety_interlocks();
 void test_recovery_counter_audit();
 void test_session_marker();
+void test_carry_attribution();
 
 int main(int argc, char** argv) {
   if (argc == 4 && std::strcmp(argv[1], "--account-ipc-worker") == 0)
@@ -119,6 +120,7 @@ int main(int argc, char** argv) {
   test_safety_interlocks();
   test_recovery_counter_audit();
   test_session_marker();
+  test_carry_attribution();
   std::printf("plat_tests: %d checks, %d failures\n", g_checks, g_fails);
   return g_fails == 0 ? 0 : 1;
 }

@@ -13,6 +13,20 @@
 //   pos <strategy_id> <symbol> <long_lots> <short_lots> <long_cost_e4> <short_cost_e4>
 
 #include <cstdio>
+#include <filesystem>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <cstring>
 #include <string>
 #include <vector>
@@ -32,7 +46,8 @@ struct PositionsRow {
 
 inline bool save_positions(const std::string& path, std::uint32_t day,
                            const std::vector<PositionsRow>& rows) {
-  std::FILE* f = std::fopen(path.c_str(), "wb");
+  const auto temporary = path + ".tmp";
+  std::FILE* f = std::fopen(temporary.c_str(), "wb");
   if (!f) return false;
   std::fprintf(f, "day %u\n", day);
   for (const auto& r : rows) {
@@ -41,8 +56,27 @@ inline bool save_positions(const std::string& path, std::uint32_t day,
                  static_cast<long long>(r.long_cost_e4),
                  static_cast<long long>(r.short_cost_e4));
   }
-  std::fclose(f);
-  return true;
+  bool ok = !std::ferror(f) && std::fflush(f) == 0;
+#ifdef _WIN32
+  ok = ok && ::_commit(::_fileno(f)) == 0;
+#else
+  ok = ok && ::fsync(::fileno(f)) == 0;
+#endif
+  ok = std::fclose(f) == 0 && ok;
+#ifdef _WIN32
+  ok = ok && MoveFileExA(temporary.c_str(), path.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+  ok = ok && std::rename(temporary.c_str(), path.c_str()) == 0;
+  if (ok) {
+    const auto parent = std::filesystem::path(path).parent_path();
+    const int directory = ::open(parent.empty() ? "." : parent.c_str(), O_RDONLY | O_DIRECTORY);
+    ok = directory >= 0 && ::fsync(directory) == 0;
+    if (directory >= 0) ::close(directory);
+  }
+#endif
+  if (!ok) std::remove(temporary.c_str());
+  return ok;
 }
 
 inline bool load_positions(const std::string& path, std::uint32_t& day,

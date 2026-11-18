@@ -256,10 +256,14 @@ class Site {
   }
 
   struct EodResult {
+    std::size_t venue_open = 0;
     std::size_t order_breaks = 0;
     bool fills_ok = false;
     Qty venue_buy = 0, venue_sell = 0;
     bool ran = false;
+    [[nodiscard]] bool clean() const {
+      return ran && !order_breaks && !venue_open && fills_ok;
+    }
   };
   [[nodiscard]] const EodResult& eod() const noexcept { return eod_; }
   [[nodiscard]] const PreFlight& preflight_result() const noexcept { return preflight_result_; }
@@ -279,6 +283,7 @@ class Site {
   void run_eod(const std::vector<VenueOpenOrder>& venue_open, Qty venue_buy, Qty venue_sell,
                bool query_ok = true) {
     eod_.order_breaks = oms_.reconcile(venue_open).size();
+    eod_.venue_open = venue_open.size();
     const auto fills = pnl_.reconcile_fills(venue_buy, venue_sell);
     eod_.fills_ok = query_ok && fills.ok;
     eod_.venue_buy = venue_buy;

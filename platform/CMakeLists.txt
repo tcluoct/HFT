@@ -310,7 +310,7 @@ set_target_properties(platd PROPERTIES
 # desk/).
 add_executable(plat_tests
   src/tests_main.cpp src/tests_util.hpp src/tests_components.cpp src/tests_risk.cpp src/tests_engine.cpp
-  src/tests_recorder.cpp src/tests_signals.cpp src/tests_ops.cpp src/tests_safety.cpp)
+  src/tests_recorder.cpp src/tests_signals.cpp src/tests_ops.cpp src/tests_safety.cpp src/platd_positions.cpp)
 hft_configure(plat_tests)
 target_link_libraries(plat_tests PRIVATE desk ${CTP_LIBS})
 foreach(dll ${CTP_DLLS})

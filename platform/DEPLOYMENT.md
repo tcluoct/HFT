@@ -184,8 +184,9 @@ strategy instances in `strategies`, with a unique ID and a `type` per instance.
 The instances all use the configured account. One daemon opens CTP market data
 and trading, starts one subprocess per enabled PM instance, and owns the
 account risk gate and order state. The current desk process mode consumes
-futures snapshots. A stalled worker is fenced without canceling its resting
-orders. The other workers and the account engine continue.
+futures snapshots. A stalled worker is fenced and its strategy halted. The
+engine sends cancels for that strategy's resting orders; verify their terminal
+status at the broker. Other workers and the account engine continue.
 
 Run the offline process startup check before connecting the CTP test account.
 It launches the configured strategies and verifies that each consumes a
@@ -202,6 +203,12 @@ against the **p99 below 50 µs** requirement with the production SDK.
 Manual orders entered in the broker terminal still require verified
 account-wide report visibility and reconciliation before enabling this mode
 for live funds.
+
+Deploy this shared-account risk change between sessions, after the previous
+binary has reached a clean close. The risk fingerprint changed: recover an
+unsealed journal with its matching binary rather than forcing it through the
+new rules. A clean exit now requires zero broker working orders and a durable
+position-attribution file; a pending reconciliation marker requires review.
 
 **Start** (a few minutes before the session, e.g. 08:45 for the day session):
 
@@ -245,8 +252,8 @@ and distributes the counter's carried totals per strategy, so each
 strategy's PnL, margin attribution, and close-yesterday validation are
 correct from the first order. The counter remains the authority on
 *quantity*: any unattributed remainder (manual trades, another terminal, a
-lost file) is assigned to the first configured strategy's book with a loud
-warning. A strategy stopped via `<name>.enabled = 0` keeps its id and its
+lost file) goes to the unattributed book and locks trading. Resolve the break
+against broker records before restart. A strategy stopped via `<name>.enabled = 0` keeps its id and its
 carried lots: the EOD write walks the PnL ledger itself, so the `.positions`
 chain carries the stopped book forward each day until the strategy is
 re-enabled (it picks the book back up) or you flatten it manually. Same-day

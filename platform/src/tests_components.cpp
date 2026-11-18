@@ -4,6 +4,7 @@
 
 #include <cfloat>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -496,6 +497,13 @@ void test_positions_file() {
   CHECK(back[0].long_lots == 3 && back[0].long_cost_e4 == px_from_cny(78'010.0));
   CHECK(back[1].strategy == 3 && back[1].short_lots == 2);
   CHECK(back[1].short_cost_e4 == px_from_cny(3'069.0));
+  const auto blocked_temp = std::string(path) + ".tmp";
+  CHECK(std::filesystem::create_directory(blocked_temp));
+  CHECK(!save_positions(path, 20'260'715, {}));
+  CHECK(load_positions(path, day, back) && back.size() == 2 && day == 20'260'714);
+  std::filesystem::remove(blocked_temp);
+  CHECK(save_positions(path, 20'260'715, {}));
+  CHECK(load_positions(path, day, back) && back.empty() && day == 20'260'715);
   std::remove(path);
 }
 

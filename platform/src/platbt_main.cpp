@@ -92,6 +92,7 @@ bool run_day(const Config& cfg, const std::vector<StratSpec>& specs, const std::
 
   InstrumentTable table = table_from_dir(r.dir());
   SiteConfig sc;
+  sc.shared_account_risk = true;
   sc.name = "backtest";
   sc.day = r.header().day;
   sc.hosted.clear();

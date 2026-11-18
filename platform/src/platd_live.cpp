@@ -98,6 +98,9 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   log_banner("platd");
 
   if (!require_keys(cfg)) return 1;
+  const AccountId account = static_cast<AccountId>(cfg.i64("account_id", 1));
+  std::vector<StratSpec> specs;
+  if (!parse_live_strategies(cfg, account, specs)) return 1;
   const bool isolated = cfg.flag("strategy_processes");
   if (isolated && (shard || cfg.i64("strategy_stall_ms", 5000) <= 0 ||
                    cfg.i64("strategy_trigger_age_us", 5000) <= 0)) {
@@ -313,20 +316,10 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   // ---- strategy lineup: named instances from config (`strategies = ...`,
   // legacy trio when the key is absent). A config that doesn't parse must
   // not trade (fail closed).
-  const AccountId account = static_cast<AccountId>(cfg.i64("account_id", 1));
-  std::vector<StratSpec> specs;
-  if (!parse_strategies(cfg, account, specs)) {
-    logf("[platd] strategy configuration is invalid — aborting\n");
-    return 1;
-  }
   for (const auto& s : specs)
     logf("[platd] strategy `%s`: %s id %u account %u\n", s.name.c_str(), kind_name(s.kind),
          s.id, s.account);
   if (isolated) {
-    for (const auto& s : specs) if (s.account != account) {
-      logf("[platd] strategy %u must use the configured account in process mode\n", s.id);
-      return 1;
-    }
     for (const auto id : hosted) if (table.at(id).is_stock()) {
       logf("[platd] strategy process mode currently supports futures snapshots\n");
       return 1;
@@ -350,7 +343,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   sc.limits = limits_from(cfg);
   sc.fees = fees_from(cfg);
   sc.epoch = tc.epoch;
-  sc.shared_account_risk = isolated;
+  sc.shared_account_risk = true;
 
   // ---- session fingerprint: the composition that produced this journal.
   // The crashed journal is unsealed (no stream hash), so this sidecar is the
@@ -504,7 +497,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
     // ---- carry-in (§9.5): the counter says how much is carried; yesterday's
     // .positions file says whose — per-strategy attribution restored here,
     // including books whose strategy is stopped this session.
-    if (!carry_in_positions(site, trader, table, account, prev_positions, specs, live_now_ns()))
+    if (!carry_in_positions(site, trader, table, account, prev_positions, live_now_ns()))
       site.block_trading();
   }
 
@@ -550,15 +543,12 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
 
   // The durable marker predates all trading. Only a fully clean session may
   // remove it; disk errors, query failures and recovery breaks leave it intact.
-  const bool clean = site.eod().ran && site.eod().order_breaks == 0 &&
-                     site.eod().fills_ok && site.journal_healthy() && !site.safety_blocked();
+  const bool clean = site.eod().clean() && site.journal_healthy() && !site.safety_blocked() &&
+                     write_eod_positions(site, table, jnl_path);
   const bool gate_cleared = marker.complete(clean);
   if (!gate_cleared)
     logf("[platd] reconciliation gate retained: review %s before restart\n",
          eod_breaks_path.c_str());
-
-  // ---- per-strategy attribution for tomorrow's carry-in.
-  write_eod_positions(site, table, jnl_path);
 
   // ---- end-of-session report (§11.3, §14): one block per configured
   // instance, plus any id the ledger carries for a stopped strategy.

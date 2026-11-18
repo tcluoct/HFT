@@ -52,8 +52,8 @@ std::string session_report(SiteT& site) {
 
   const auto& eod = site.eod();
   if (eod.ran) {
-    r += std::format("EOD recon: order breaks {}  fills {}  (venue buy/sell {}/{})\n",
-                     eod.order_breaks, eod.fills_ok ? "OK" : "BREAK", eod.venue_buy,
+    r += std::format("EOD recon: order breaks {}  still open {}  fills {}  (venue buy/sell {}/{})\n",
+                     eod.order_breaks, eod.venue_open, eod.fills_ok ? "OK" : "BREAK", eod.venue_buy,
                      eod.venue_sell);
   }
   return r;

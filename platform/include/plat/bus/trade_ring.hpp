@@ -35,6 +35,7 @@ class TradeRing {
  public:
   static constexpr std::size_t kSlots = 1 << 12;
   enum class Poll : std::uint8_t { Empty, Event, Fault };
+  void fault() noexcept { faulted_.store(true, std::memory_order_release); }
 
   void publish(const TradeEvent& event) noexcept {
     if (faulted_.load(std::memory_order_relaxed)) return;

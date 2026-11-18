@@ -98,6 +98,7 @@ struct WorkerProcess {
   RunnerBinding binding;
   std::uint64_t last_progress = 0;
   Nanos last_activity = 0;
+  Nanos next_cancel_check = 0;
 #ifdef _WIN32
   HANDLE process = nullptr;
   HANDLE job = nullptr;
@@ -281,9 +282,31 @@ bool StrategyProcesses::poll(void* self, Nanos now) {
       worker->last_activity = now;
     }
     if (binding.fenced || now - worker->last_activity >= state.timeout) {
-      if (!shared.stop.exchange(true, std::memory_order_release))
-        logf("[worker] strategy %u fenced, check process and resting orders\n", binding.strategy);
       binding.fenced = true;
+      if (!shared.stop.exchange(true, std::memory_order_acq_rel)) {
+        state.site.command_kill(KillScope::Strategy, KillAction::Halt, binding.strategy, now);
+        worker->next_cancel_check = now + kNsPerSec;
+        logf("[worker] strategy %u halted; verify its resting orders have canceled\n",
+             binding.strategy);
+        work = true;
+      } else if (worker->next_cancel_check && now >= worker->next_cancel_check) {
+        if (state.site.risk().kill().mode(shared.account, binding.strategy) != KillMode::Halt) {
+          worker->next_cancel_check = 0;
+          continue;
+        }
+        bool resting = false;
+        for (const auto inst : state.site.config().hosted)
+          state.site.oms().for_each_open(inst, [&](const OmsOrder& order) {
+            resting |= order.strategy == binding.strategy;
+          });
+        if (resting) {
+          state.site.command_kill(KillScope::Strategy, KillAction::Halt, binding.strategy, now);
+          worker->next_cancel_check = now + kNsPerSec;
+        } else {
+          worker->next_cancel_check = 0;
+          logf("[worker] strategy %u has no remaining working orders in OMS\n", binding.strategy);
+        }
+      }
       continue;
     }
     work |= state.site.poll(binding, now);
@@ -307,7 +330,7 @@ void StrategyProcesses::publish(void* self, const Envelope& event) {
 int StrategyProcesses::check(const Config& cfg, const std::string& config_path) {
   const auto account = static_cast<AccountId>(cfg.i64("account_id", 1));
   std::vector<StratSpec> specs;
-  if (!parse_strategies(cfg, account, specs) || specs.empty()) return 1;
+  if (!parse_live_strategies(cfg, account, specs) || specs.empty()) return 1;
   InstrumentTable table;
   SiteConfig sc;
   sc.journal_path = "plat-worker-check-" + std::to_string(perf_now_ns());
@@ -343,10 +366,25 @@ int StrategyProcesses::check(const Config& cfg, const std::string& config_path) 
         received &= child->mailbox.get()->processed_feed.load(std::memory_order_acquire) != 0;
       if (!received) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    if (received) {
+      site.risk().set_phase(Venue::SHFE, Phase::Continuous);
+      NewOrderReq resting{};
+      resting.account = account;
+      resting.strategy = specs.front().id;
+      resting.inst = tick.inst;
+      resting.cl_id = make_order_id(1, 1);
+      resting.qty = 1;
+      site.oms().on_new(resting);
+      processes.state_->workers.front()->binding.fenced = true;
+      poll(&processes, now);
+      received = site.risk().session().cancel_in_flight(resting.cl_id, now, kNsPerSec);
+      for (const auto& spec : specs)
+        received &= site.risk().kill().halted(account, spec.id) == (spec.id == resting.strategy);
+    }
   }
   processes.state_.reset();
   std::remove((sc.journal_path + ".ref").c_str());
-  logf("[worker] offline startup and shared tick delivery: %s (%zu configured workers)\n",
+  logf("[worker] offline startup, shared tick delivery and scoped cancellation: %s (%zu workers)\n",
        received ? "PASS" : "FAIL", specs.size());
   return received ? 0 : 1;
 }

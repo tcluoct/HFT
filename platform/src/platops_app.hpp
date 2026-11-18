@@ -150,8 +150,8 @@ class MirrorShard {
     sc.fees = fees_from(cfg_);
     // Same key the live site read — order ids must regenerate identically.
     sc.epoch = static_cast<std::uint16_t>(cfg_.i64("epoch", 1));
-    sc.shared_account_risk = cfg_.flag("strategy_processes");
-    auto banks = sc.shared_account_risk ? Pack::Banks{} : Pack::banks(cfg_, table_, specs_);
+    sc.shared_account_risk = true;
+    auto banks = cfg_.flag("strategy_processes") ? Pack::Banks{} : Pack::banks(cfg_, table_, specs_);
     site_ = std::make_unique<MirrorSite>(table_, std::move(sc), MirrorSite::Mode::Replay,
                                          std::move(banks));
     return true;

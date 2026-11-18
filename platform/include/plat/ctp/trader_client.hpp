@@ -31,6 +31,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,6 +103,7 @@ struct AccountOpenOrder {
   Qty leaves = 0;
 };
 struct AccountTrade {
+  std::string execution_id;
   std::uint64_t venue_no = 0;  // parsed OrderSysID of the owning order
   std::uint64_t ref_seq = 0;
   Price px = 0;
@@ -178,7 +180,8 @@ class TraderClient final : public CThostFtdcTraderSpi {
   // exchange order id), and cancel() reaches it via ExchangeID+OrderSysID.
   void adopt_order(OrderId cl_id, InstrumentId inst, StrategyId strategy, AccountId account,
                    Side side, Offset offset, Price px, Qty qty, Qty cum,
-                   const char* symbol, const char* exchange, const char* sys_id);
+                   const char* symbol, const char* exchange, const char* sys_id,
+                   std::set<std::string> executions = {});
 
   std::optional<AccountFunds> query_funds();
 
@@ -230,8 +233,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
 
   // EOD queries return ACCOUNT-level rows; several shard processes share one
   // account (one CTP session each), so reconciliation must be session-scoped:
-  // another shard's open orders and fills are its own shard's business (and
-  // the firm aggregator's), not a break here.
+  // a foreign working order on a hosted instrument still blocks clean EOD.
   void OnRspQryOrder(CThostFtdcOrderField* o, CThostFtdcRspInfoField* info, int,
                      bool bIsLast) override;
 
@@ -244,6 +246,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
  private:
   friend struct TraderClientTestAccess;
   struct OrderCtx {
+    std::set<std::string> executions;
     OrderId cl_id = kNoOrder;
     std::uint64_t venue_no = 0;
     Nanos trigger_ts = 0;

@@ -41,6 +41,18 @@ using namespace desk;
 // asserts every pack member is CRTP — no vtable on the hot path.)
 using LiveSite = Pack::AccountFor<plat::ctp::TraderClient>;
 
+inline bool parse_live_strategies(const plat::Config& cfg, plat::AccountId account,
+                                  std::vector<StratSpec>& specs) {
+  if (!parse_strategies(cfg, account, specs)) return false;
+  for (const auto& spec : specs) {
+    if (spec.account != account) {
+      plat::logf("[platd] strategy %u must use the configured broker account\n", spec.id);
+      return false;
+    }
+  }
+  return true;
+}
+
 // ---- platd-specific config (platd_config.cpp; the shared params come from
 // plat/engine/params.hpp + desk/pack.hpp above; shard_config /
 // fleet_shard_ids from fleet_cfg.hpp, shared with platops)
@@ -57,14 +69,16 @@ void write_cmd_file(int shard, const std::string& cmd);
 // The EOD write walks the PnL ledger itself, so a strategy that is stopped
 // (`<name>.enabled = 0`) keeps its carried lots flowing through the chain
 // until it is re-enabled or manually flattened.
-void write_eod_positions(LiveSite& site, const plat::InstrumentTable& table,
+bool write_eod_positions(LiveSite& site, const plat::InstrumentTable& table,
                          const std::string& jnl_path);
 std::vector<plat::PositionsRow> read_prev_positions(const std::string& jnl_path,
                                                     std::uint32_t expect_day);
 bool carry_in_positions(LiveSite& site, plat::ctp::TraderClient& trader,
                         const plat::InstrumentTable& table, plat::AccountId account,
-                        const std::vector<plat::PositionsRow>& prev,
-                        const std::vector<StratSpec>& specs, plat::Nanos now);
+                        const std::vector<plat::PositionsRow>& prev, plat::Nanos now);
+bool apply_carry(LiveSite& site, const plat::InstrumentTable& table, plat::AccountId account,
+                 std::vector<plat::PositionsRow> unallocated,
+                 const std::vector<plat::ctp::PositionRow>& positions, plat::Nanos now);
 
 // ---- entry points
 int run_live(const plat::Config& cfg, bool force_resume, const std::string& cfg_path,
