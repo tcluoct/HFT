@@ -51,6 +51,8 @@ enum class Schema : std::uint16_t {
   PositionTransfer,
   RiskLimits,
   CarryIn,
+  StrategyOrder,
+  StrategyCancel,
 };
 
 // ---------------------------------------------------------------- market data
@@ -170,6 +172,34 @@ struct CancelReq {
   std::uint8_t pad_[8]{};
 };
 static_assert(std::is_trivially_copyable_v<CancelReq> && sizeof(CancelReq) == 32);
+
+// Source messages from the account engine's runner binding.
+struct StrategyOrderCmd {
+  std::uint64_t generation;
+  std::uint64_t request_seq;
+  std::uint64_t feed_seq;
+  Nanos trigger_ts;
+  Price px;
+  Qty qty;
+  InstrumentId inst;
+  StrategyId strategy;
+  AccountId account;
+  Side side;
+  Offset offset;
+  Tif tif;
+  std::uint8_t pad_[5]{};
+};
+static_assert(std::is_trivially_copyable_v<StrategyOrderCmd> && sizeof(StrategyOrderCmd) == 64);
+
+struct StrategyCancelCmd {
+  std::uint64_t generation;
+  std::uint64_t request_seq;
+  OrderId cl_id;
+  StrategyId strategy;
+  AccountId account;
+  std::uint8_t pad_[4]{};
+};
+static_assert(std::is_trivially_copyable_v<StrategyCancelCmd> && sizeof(StrategyCancelCmd) == 32);
 
 enum class ExecType : std::uint8_t {
   Ack,           // accepted by venue
@@ -455,6 +485,15 @@ static_assert(std::is_trivially_copyable_v<SessionStateEvt> && sizeof(SessionSta
 
 template <typename T>
 struct MsgTraits;  // undefined base: publishing an unregistered type is a compile error
+
+template <> struct MsgTraits<StrategyOrderCmd> {
+  static constexpr Schema schema = Schema::StrategyOrder;
+  static constexpr Topic topic = Topic::OrderFlow;
+};
+template <> struct MsgTraits<StrategyCancelCmd> {
+  static constexpr Schema schema = Schema::StrategyCancel;
+  static constexpr Topic topic = Topic::OrderFlow;
+};
 
 // clang-format off
 template <> struct MsgTraits<MdOrderEvt>      { static constexpr Schema schema = Schema::MdOrder;      static constexpr Topic topic = Topic::MarketData; };

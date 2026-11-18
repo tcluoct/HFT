@@ -18,6 +18,7 @@
 #include "plat/core/thread.hpp"
 #include "plat/replay/journal_dump.hpp"
 #include "platd_app.hpp"
+#include "platd_workers.hpp"
 
 using namespace platd;
 
@@ -34,6 +35,13 @@ bool load_or_die(plat::Config& cfg, const char* path) {
 int main(int argc, char** argv) {
   plat::init_console_utf8();  // logs contain em-dashes / CTP error strings may be 中文
   plat::install_crash_handlers("platd");  // abnormal death → named reason + stack + minidump
+  if (argc == 6 && std::strcmp(argv[1], "--strategy-worker") == 0)
+    return run_strategy_worker(argv[2], argv[3], argv[4], argv[5]);
+  if (argc == 3 && std::strcmp(argv[1], "--check-workers") == 0) {
+    plat::Config cfg;
+    if (!load_or_die(cfg, argv[2])) return 1;
+    return StrategyProcesses::check(cfg, argv[2]);
+  }
   if (argc >= 3 && std::strcmp(argv[1], "--fleet") == 0) {
     return run_fleet(argv[2]);
   }
@@ -77,6 +85,7 @@ int main(int argc, char** argv) {
       "  platd --shard N <fleet.cfg> [--resume]  run as one shard of the fleet\n"
       "  platd <config.cfg> --resume        force resume (fails if nothing to resume)\n"
       "  platd --check <config.cfg>         validate config + CTP linkage\n"
+      "  platd --check-workers <config.cfg> launch configured processes and test a shared tick offline\n"
       "  platd --replay <config.cfg> <jnl>  deterministic replay/recovery drill\n"
       "  platd --dump <jnl> [count]         human-readable journal listing\n");
   return 1;

@@ -108,6 +108,14 @@ class SharedSegment {
       ::shm_unlink(full.c_str());
       return s;
     }
+    if (!exclusive_create) {
+      struct stat info{};
+      if (::fstat(fd, &info) != 0 || info.st_size < 0 ||
+          static_cast<std::uintmax_t>(info.st_size) < bytes) {
+        ::close(fd);
+        return s;
+      }
+    }
     void* mem = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);  // the mapping keeps the segment alive
     if (mem == MAP_FAILED) {

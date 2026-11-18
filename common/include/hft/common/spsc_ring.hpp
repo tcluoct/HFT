@@ -1,5 +1,8 @@
 #pragma once
 // Wait-free single-producer/single-consumer ring buffer.
+// For interprocess use, construct the ring in shared storage before either
+// endpoint attaches. Each endpoint owns its cursor and cached peer cursor.
+// One slot is reserved to distinguish full from empty.
 //
 // Low-latency techniques used here:
 //  * power-of-two capacity  -> index wrap is a mask, not a modulo
@@ -22,38 +25,62 @@ namespace hft {
 template <typename T, std::size_t Capacity>
   requires std::is_trivially_copyable_v<T> && (std::has_single_bit(Capacity))
 class SpscRing {
+  static_assert(std::atomic<std::size_t>::is_always_lock_free);
+
  public:
   SpscRing() = default;
   SpscRing(const SpscRing&) = delete;
   SpscRing& operator=(const SpscRing&) = delete;
 
-  // Producer thread only.
+  // Producer only. The consumer can only free space, so a successful
+  // check remains valid until the producer pushes.
+  [[nodiscard]] HFT_FORCE_INLINE bool can_push() noexcept {
+    return has_room((head_.load(std::memory_order_relaxed) + 1) & kMask);
+  }
+
+  // Producer only.
   [[nodiscard]] HFT_FORCE_INLINE bool try_push(const T& v) noexcept {
     const std::size_t head = head_.load(std::memory_order_relaxed);
     const std::size_t next = (head + 1) & kMask;
-    if (next == cached_tail_) [[unlikely]] {
-      cached_tail_ = tail_.load(std::memory_order_acquire);
-      if (next == cached_tail_) return false;  // truly full
-    }
+    if (!has_room(next)) return false;
     slots_[head] = v;
     head_.store(next, std::memory_order_release);  // publish the slot write
     return true;
   }
 
-  // Consumer thread only.
-  [[nodiscard]] HFT_FORCE_INLINE bool try_pop(T& out) noexcept {
+  // Consumer only. The slot is held until pop(), allowing a consumer to
+  // defer an item without advancing the queue.
+  [[nodiscard]] HFT_FORCE_INLINE const T* front() noexcept {
     const std::size_t tail = tail_.load(std::memory_order_relaxed);
     if (tail == cached_head_) [[unlikely]] {
       cached_head_ = head_.load(std::memory_order_acquire);
-      if (tail == cached_head_) return false;  // truly empty
+      if (tail == cached_head_) return nullptr;
     }
-    out = slots_[tail];
+    return &slots_[tail];
+  }
+
+  // Consumer only. Requires a successful front(). Invalidates its pointer.
+  HFT_FORCE_INLINE void pop() noexcept {
+    const std::size_t tail = tail_.load(std::memory_order_relaxed);
     tail_.store((tail + 1) & kMask, std::memory_order_release);  // free the slot
+  }
+
+  [[nodiscard]] HFT_FORCE_INLINE bool try_pop(T& out) noexcept {
+    const T* slot = front();
+    if (!slot) return false;
+    out = *slot;
+    pop();
     return true;
   }
 
  private:
   static constexpr std::size_t kMask = Capacity - 1;
+
+  [[nodiscard]] HFT_FORCE_INLINE bool has_room(std::size_t next) noexcept {
+    if (next == cached_tail_) [[unlikely]]
+      cached_tail_ = tail_.load(std::memory_order_acquire);
+    return next != cached_tail_;
+  }
 
   std::array<T, Capacity> slots_{};
 

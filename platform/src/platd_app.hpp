@@ -39,7 +39,7 @@ using namespace desk;
 // is config (`strategies = ...`), parsed by desk::parse_strategies so live
 // and backtest are built from the identical definitions. (StratPack itself
 // asserts every pack member is CRTP — no vtable on the hot path.)
-using LiveSite = PackSite<plat::ctp::TraderClient>;
+using LiveSite = Pack::AccountFor<plat::ctp::TraderClient>;
 
 // ---- platd-specific config (platd_config.cpp; the shared params come from
 // plat/engine/params.hpp + desk/pack.hpp above; shard_config /
@@ -72,5 +72,7 @@ int run_live(const plat::Config& cfg, bool force_resume, const std::string& cfg_
 int run_fleet(const std::string& cfg_path);                        // platd_fleet.cpp
 int run_check(const plat::Config& cfg);                            // platd_tools.cpp
 int run_replay(const plat::Config& cfg, const std::string& jnl_path);
+int run_strategy_worker(const char* mailbox, const char* feed, const char* config,
+                        const char* journal);
 
 }  // namespace platd

@@ -50,11 +50,11 @@ namespace plat {
 class RiskGate {
  public:
   RiskGate(const InstrumentTable& table, const Oms& oms, const PnlLedger& pnl,
-           RiskLimits limits)
+           RiskLimits limits, bool shared_account = false)
       : table_(&table), oms_(&oms), pnl_(&pnl), limits_(limits),
         dup_(limits.duplicate_window, limits.duplicate_horizon), guard_(table.size()),
         stock_books_(table.size(), nullptr),
-        fut_books_(table.size(), nullptr) {
+        fut_books_(table.size(), nullptr), shared_account_(shared_account) {
   }
 
   // Book mirrors: dense-id flat arrays — one indexed load per check, no
@@ -147,7 +147,7 @@ class RiskGate {
         return RiskCheck::SizeNotional;
     }
 
-    // 4) Position / exposure cap per strategy (net + this order's add).
+    // 4) Position / exposure cap (net plus worst-case working exposure).
     //    A reduce-only close cannot increase exposure, and blocking it on the
     //    current (possibly over-cap) mark is exactly when it matters most.
     if (!emergency_close && exposure_after(r) > limits_.max_net_notional_e4)
@@ -167,7 +167,10 @@ class RiskGate {
     if (limits_.check_close_position && !in.is_stock() && r.offset != Offset::Open) {
       const Position* p = pnl_->find(r.account, r.strategy, r.inst);
       const Qty avail = closeable(p, r.side, r.offset);
-      if (r.qty > avail) return RiskCheck::SellableInventory;
+      const Qty reserved = shared_account_ ? working(r, [&](const OmsOrder& o) {
+        return o.strategy == r.strategy && o.side == r.side && o.offset == r.offset;
+      }) : 0;
+      if (r.qty > avail - reserved) return RiskCheck::SellableInventory;
     }
 
     // 17–20) Cash-equity exchange rules.
@@ -514,12 +517,19 @@ class RiskGate {
       const Price px = reference_px(r.inst, in);
       return px > 0 ? px : in.prev_close;
     }();
-    std::int64_t net = 0;
-    if (const Position* p = pnl_->find(r.account, r.strategy, r.inst))
-      net = p->net() * ref * in.multiplier;
+    Qty net_qty = 0;
+    if (shared_account_) {
+      pnl_->for_each([&](const PosKey& key, const Position& position) {
+        if (key.account == r.account && key.inst == r.inst) net_qty += position.net();
+      });
+    } else if (const Position* p = pnl_->find(r.account, r.strategy, r.inst)) {
+      net_qty = p->net();
+    }
+    const std::int64_t net = net_qty * ref * in.multiplier;
     std::int64_t open_buys = 0, open_sells = 0;
     oms_->for_each_open(r.inst, [&](const OmsOrder& o) {
-      if (o.account != r.account || o.strategy != r.strategy || o.cl_id == r.cl_id) return;
+      if (o.account != r.account || o.cl_id == r.cl_id ||
+          (!shared_account_ && o.strategy != r.strategy)) return;
       (o.side == Side::Buy ? open_buys : open_sells) +=
           o.leaves * ref * in.multiplier;
     });
@@ -620,6 +630,7 @@ class RiskGate {
   std::vector<const FutBook*> fut_books_;
   Phase phase_[kVenueCount] = {};
   std::vector<Counters> counters_;  // linear scan: a site trades a handful of accounts
+  const bool shared_account_;
 };
 
 }  // namespace plat

@@ -177,6 +177,32 @@ C:\trading\platd\
 
 ## 6. Runbook
 
+### Concurrent strategies on one account
+
+Set `strategy_processes = 1` in a standalone config. List the enabled static
+strategy instances in `strategies`, with a unique ID and a `type` per instance.
+The instances all use the configured account. One daemon opens CTP market data
+and trading, starts one subprocess per enabled PM instance, and owns the
+account risk gate and order state. The current desk process mode consumes
+futures snapshots. A stalled worker is fenced without canceling its resting
+orders. The other workers and the account engine continue.
+
+Run the offline process startup check before connecting the CTP test account.
+It launches the configured strategies and verifies that each consumes a
+shared synthetic tick. Run both commands from the normal session directory.
+
+```powershell
+.\platd.exe --check-workers .\platd.test.cfg
+.\platd.exe .\platd.test.cfg
+```
+
+On Linux use `./platd`. Each strategy can have its own `<name>.core` setting.
+`spin = 1` selects busy polling. Qualify tick-to-trade on the broker host
+against the **p99 below 50 µs** requirement with the production SDK.
+Manual orders entered in the broker terminal still require verified
+account-wide report visibility and reconciliation before enabling this mode
+for live funds.
+
 **Start** (a few minutes before the session, e.g. 08:45 for the day session):
 
 ```

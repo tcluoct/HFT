@@ -2,6 +2,8 @@
 // run order (components first, then the engine suites built on them).
 
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 
 #include "plat/core/crash.hpp"  // a crashing suite prints a named stack
 
@@ -32,6 +34,9 @@ void test_kbar_snapshot();
 void test_indicators();
 // tests_engine.cpp
 void test_site_loop();
+void test_shared_account_engine();
+void test_account_process_ipc(const char* exe);
+int run_account_ipc_worker(const char* name, int index);
 void test_latency_measurements();
 void test_latency_boundaries();
 void test_crash_resume();
@@ -52,12 +57,23 @@ void test_ops_mirror();
 void test_ops_journal_tailer();
 // tests_safety.cpp
 void test_query_fail_closed();
+void test_trade_ring_transport();
 void test_safety_interlocks();
 void test_recovery_counter_audit();
 void test_session_marker();
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 4 && std::strcmp(argv[1], "--account-ipc-worker") == 0)
+    return run_account_ipc_worker(argv[2], std::strcmp(argv[3], "0") == 0 ? 0 : 1);
   plat::install_crash_handlers("plat_tests");
+  const auto exe = std::filesystem::absolute(argv[0]).string();
+  if (argc == 2 && std::strcmp(argv[1], "--shared-account-tests") == 0) {
+    test_shared_account_engine();
+    test_account_process_ipc(exe.c_str());
+    test_trade_ring_transport();
+    std::printf("shared account: %d checks, %d failures\n", g_checks, g_fails);
+    return g_fails == 0 ? 0 : 1;
+  }
   test_conv();
   test_config();
   test_fut_book();
@@ -79,6 +95,8 @@ int main() {
   test_kbar_snapshot();
   test_indicators();
   test_site_loop();
+  test_shared_account_engine();
+  test_account_process_ipc(exe.c_str());
   test_latency_measurements();
   test_latency_boundaries();
   test_crash_resume();
@@ -97,6 +115,7 @@ int main() {
   test_ops_mirror();
   test_ops_journal_tailer();
   test_query_fail_closed();
+  test_trade_ring_transport();
   test_safety_interlocks();
   test_recovery_counter_audit();
   test_session_marker();

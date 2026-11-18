@@ -25,6 +25,7 @@
 #include "plat/engine/snapshot.hpp"
 #include "plat/replay/sidecar.hpp"
 #include "platd_app.hpp"
+#include "platd_workers.hpp"
 
 using namespace plat;
 
@@ -97,12 +98,18 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   log_banner("platd");
 
   if (!require_keys(cfg)) return 1;
+  const bool isolated = cfg.flag("strategy_processes");
+  if (isolated && (shard || cfg.i64("strategy_stall_ms", 5000) <= 0 ||
+                   cfg.i64("strategy_trigger_age_us", 5000) <= 0)) {
+    logf("[platd] strategy_processes needs a standalone site and positive worker timeouts\n");
+    return 1;
+  }
 
   std::signal(SIGINT, [](int) { live_stop_flag().store(true); });
   std::signal(SIGTERM, [](int) { live_stop_flag().store(true); });
 
   Ring md_ring(1 << 14);
-  Ring trade_ring(1 << 12);
+  TradeRing trade_ring;
 
   // ---- counter session first: reference data comes from the counter.
   ctp::TraderConfig tc;
@@ -315,6 +322,16 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   for (const auto& s : specs)
     logf("[platd] strategy `%s`: %s id %u account %u\n", s.name.c_str(), kind_name(s.kind),
          s.id, s.account);
+  if (isolated) {
+    for (const auto& s : specs) if (s.account != account) {
+      logf("[platd] strategy %u must use the configured account in process mode\n", s.id);
+      return 1;
+    }
+    for (const auto id : hosted) if (table.at(id).is_stock()) {
+      logf("[platd] strategy process mode currently supports futures snapshots\n");
+      return 1;
+    }
+  }
   if (specs.empty())
     logf("[platd] NOTE: no enabled strategies — running as a position/journal holder only\n");
 
@@ -333,6 +350,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   sc.limits = limits_from(cfg);
   sc.fees = fees_from(cfg);
   sc.epoch = tc.epoch;
+  sc.shared_account_risk = isolated;
 
   // ---- session fingerprint: the composition that produced this journal.
   // The crashed journal is unsealed (no stream hash), so this sidecar is the
@@ -341,7 +359,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   session_fp.build = build_fingerprint();
   session_fp.pack = Pack::fingerprint();
   session_fp.config = config_fingerprint(specs, sc.fees, table, hosted,
-                                         sc.limits.max_actions_per_sec);
+                                         sc.limits.max_actions_per_sec, isolated);
   session_fp.day = sc.day;
   session_fp.site = sc.id;
   const std::string session_path = sc.journal_path + ".session";
@@ -386,7 +404,9 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
     return 1;
   }
 
-  LiveSite site(table, sc, LiveSite::Mode::Live, Pack::banks(cfg, table, specs));
+  LiveSite site(table, sc, LiveSite::Mode::Live,
+                isolated ? Pack::Banks{} : Pack::banks(cfg, table, specs), account,
+                cfg.i64("strategy_trigger_age_us", 5000) * 1000);
   site.set_gateway(&trader);
   if (!resume) {
     // Pin the startup limits into the journal. Replay/recovery therefore uses
@@ -418,7 +438,7 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
 
   // Persist the instrument snapshot next to the journal: replay reconstructs
   // the exact table this session traded with.
-  save_sidecar(sc.journal_path, table);
+  if (!save_sidecar(sc.journal_path, table) && isolated) return 1;
 
   if (resume) {
     // ---- crash recovery (§11.2): restore the prefix as fast as possible.
@@ -496,7 +516,13 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   mc.password = resolve_secret(cfg, "password");
   mc.flow_path = cfg.str("md_flow_path", "ctp_md_flow/");
   std::filesystem::create_directories(mc.flow_path, fs_ec);
-  ctp::MdClient md(mc, md_ring, &live_now_ns);
+  StrategyProcesses workers;
+  if (isolated && !workers.launch(site, cfg, specs, cfg_path)) {
+    logf("[platd] could not launch strategy processes\n");
+    return 1;
+  }
+  Ring& market = isolated ? workers.market() : md_ring;
+  ctp::MdClient md(mc, market, &live_now_ns);
   for (const InstrumentId id : hosted)
     md.add_instrument(table.at(id).symbol, id, table.at(id).venue);
   md.start();
@@ -508,7 +534,11 @@ int run_live(const Config& cfg, bool force_resume, const std::string& cfg_path, 
   opt.rt = cfg.flag("rt", false);
   opt.cmd_file = cfg.str("cmd_file", sc.name + ".cmd");
   opt.account = account;  // manual orders/transfers book under the site account
-  LiveDriver<LiveSite> driver(site, md_ring, trade_ring, schedule_from(cfg), opt);
+  LiveDriver<LiveSite> driver(site, market, trade_ring, schedule_from(cfg), opt);
+  if (isolated) {
+    site.set_event_sink(&StrategyProcesses::publish, &workers);
+    driver.set_worker_poll(&StrategyProcesses::poll, &workers);
+  }
   EodBridge eod{&trader};
   driver.set_eod_query(&EodBridge::query, &eod);
   ReloadContext reload_ctx{cfg_path, shard};

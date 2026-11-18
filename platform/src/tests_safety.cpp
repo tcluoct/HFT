@@ -19,6 +19,7 @@ struct TraderClientTestAccess {
     return c.run_query(send, std::chrono::milliseconds(5));
   }
   static std::size_t positions(const TraderClient& c) { return c.qry_positions_.size(); }
+  static void set_state(TraderClient& c, SessState state) { c.set_state(state); }
 };
 }
 
@@ -58,9 +59,52 @@ struct Counter {
 };
 }
 
+void test_trade_ring_transport() {
+  TradeRing ring;
+  ctp::TraderClient client({}, ring, +[]() -> Nanos { return 123; });
+  ctp::TraderClientTestAccess::set_state(client, SessState::Up);
+  const OrderId cl_id = make_order_id(1, 17);
+  client.adopt_order(cl_id, 0, 4, 7, Side::Buy, Offset::Open, px_from_cny(78'000),
+                     3, 0, "cu2701", "SHFE", "12345");
+  CThostFtdcTradeField fill{};
+  ctp::order_ref_from_seq(17, fill.OrderRef);
+  std::memcpy(fill.OrderSysID, "12345", sizeof("12345"));
+  fill.Price = 78'010.0;
+  fill.Volume = 2;
+  fill.OffsetFlag = THOST_FTDC_OF_Open;
+  client.OnRtnTrade(&fill);
+  fill.Volume = 1;
+  client.OnRtnTrade(&fill);
+
+  TradeEvent event;
+  CHECK(ring.poll(event) == TradeRing::Poll::Event && event.kind == TradeEvent::Kind::Session);
+  if (event.kind == TradeEvent::Kind::Session)
+    CHECK(event.session.state == SessState::Up && event.session.ts == 123);
+  CHECK(ring.poll(event) == TradeRing::Poll::Event && event.kind == TradeEvent::Kind::Report);
+  if (event.kind == TradeEvent::Kind::Report) {
+    const auto& report = event.report;
+    CHECK(report.type == ExecType::Fill && report.cl_id == cl_id);
+    CHECK(report.account == 7 && report.strategy == 4 && report.inst == 0);
+    CHECK(report.qty == 2 && report.cum == 2 && report.leaves == 1);
+    CHECK(report.ts == 123 && report.px == px_from_cny(fill.Price));
+  }
+  CHECK(ring.poll(event) == TradeRing::Poll::Event && event.kind == TradeEvent::Kind::Report);
+  if (event.kind == TradeEvent::Kind::Report)
+    CHECK(event.report.qty == 1 && event.report.cum == 3 && event.report.leaves == 0);
+  CHECK(ring.poll(event) == TradeRing::Poll::Empty);
+
+  const TradeEvent session{SessionStateEvt{123, Venue::SHFE, SessState::Up}};
+  for (std::size_t i = 0; i < TradeRing::kSlots - 1; ++i) ring.publish(session);
+  CHECK(ring.poll(event) == TradeRing::Poll::Event);
+  ring.publish(session);  // reuse the freed slot
+  ring.publish(session);  // overflow invalidates the stream
+  CHECK(ring.poll(event) == TradeRing::Poll::Fault);
+  CHECK(ring.poll(event) == TradeRing::Poll::Fault);
+}
+
 void test_query_fail_closed() {
   using Access = ctp::TraderClientTestAccess;
-  Ring ring(32);
+  TradeRing ring;
   ctp::TraderClient client({}, ring, +[]() -> Nanos { return 1; });
   int expired = 0;
   CHECK(!Access::query(client, [&](int id) { expired = id; return 0; }));

@@ -131,13 +131,14 @@ class MdClient final : public CThostFtdcMdSpi {
   }
 
   void OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* d) override {
+    const Nanos received = now_();
     if (!d) return;
     Sub* sub = find(d->InstrumentID);
     if (!sub) return;
 
     MdSnapshotEvt s{};
     s.feed_seq = ++sub->seq;
-    s.ts = now_();
+    s.ts = received;
     s.bid_px[0] = px_from_ctp(d->BidPrice1);  s.bid_qty[0] = d->BidVolume1;
     s.bid_px[1] = px_from_ctp(d->BidPrice2);  s.bid_qty[1] = d->BidVolume2;
     s.bid_px[2] = px_from_ctp(d->BidPrice3);  s.bid_qty[2] = d->BidVolume3;

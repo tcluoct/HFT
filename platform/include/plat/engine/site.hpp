@@ -72,6 +72,7 @@ struct SiteConfig {
   RiskLimits limits{};
   FeeSchedule fees{};
   std::uint16_t epoch = 1;          // order-id epoch (§11.2)
+  bool shared_account_risk = false;
 };
 
 // Timer scheduling crosses to the driver's wall-clock heap through a plain
@@ -91,7 +92,7 @@ class Site {
        std::tuple<std::vector<Strats>...> banks)
       : table_(&table), cfg_(std::move(cfg)), mode_(mode),
         stream_(cfg_.id), pnl_(table, cfg_.fees),
-        risk_(table, oms_, pnl_, cfg_.limits),
+        risk_(table, oms_, pnl_, cfg_.limits, cfg_.shared_account_risk),
         fut_books_(table.size()), has_fut_(table.size(), 0),
         stock_books_(table.size()),
         strats_(std::move(banks)) {
@@ -113,6 +114,11 @@ class Site {
 
   // Live-side adapters, attached by the driver before the session arms.
   void set_gateway(Gateway* gw) noexcept { gw_ = gw; }
+  using EventSink = void (*)(void*, const Envelope&);
+  void set_event_sink(EventSink sink, void* context) noexcept {
+    event_sink_ = sink;
+    event_sink_ctx_ = context;
+  }
   void set_timer_sink(TimerSinkFn fn, void* ctx) noexcept {
     timer_fn_ = fn;
     timer_ctx_ = ctx;
@@ -158,6 +164,7 @@ class Site {
   // cl_id of the most recent operator `order` command (risk-passed or not) —
   // lets the console echo it back so the operator has an id to `cancel`.
   [[nodiscard]] OrderId last_manual_order_cl_id() const noexcept { return last_manual_cl_id_; }
+  [[nodiscard]] OrderId last_strategy_order_cl_id() const noexcept { return last_strategy_cl_id_; }
   // Bank I: every configured instance of the I-th strategy type, in config
   // order (possibly empty, possibly several with different ids/params).
   template <std::size_t I>
@@ -517,6 +524,9 @@ class Site {
   StrategyCalcTimer strategy_timer_;
   RiskDeny last_deny_{};
   OrderId last_manual_cl_id_ = kNoOrder;
+  OrderId last_strategy_cl_id_ = kNoOrder;
+  EventSink event_sink_ = nullptr;
+  void* event_sink_ctx_ = nullptr;
   bool books_attached_ = false;
   bool go_ = false;
   PreFlight preflight_result_{};

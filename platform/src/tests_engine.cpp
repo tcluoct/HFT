@@ -4,15 +4,330 @@
 // behaviour lives with its team (strategies/<team>/src/tests.cpp); the
 // cross-team composition lives with the desk (desk/src/tests.cpp).
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#endif
 
 #include "plat/bus/journal.hpp"
+#include "plat/bus/shared_channel.hpp"
+#include "plat/engine/account.hpp"
 #include "plat/engine/fingerprint.hpp"
 #include "plat/engine/snapshot.hpp"
 #include "plat/replay/replayer.hpp"  // compile coverage: recovery tooling API
 #include "tests_util.hpp"
+
+namespace {
+struct AccountIpcFixture {
+  Ring::SharedStorage<64> market;
+  RunnerMailbox mailbox[2];
+  std::atomic<bool> stop{false};
+};
+using AccountIpc = SharedChannel<AccountIpcFixture, 0x48465402>;
+
+struct MomentumIpcContext {
+  RunnerMailbox& mailbox;
+  InstrumentTable table = one_future();
+  FutBook book;
+  std::uint64_t feed_seq = 0;
+
+  const Instrument& instrument(InstrumentId inst) const { return table.at(inst); }
+  const FutBook* fut_book(InstrumentId) const { return &book; }
+  OrderId place(InstrumentId inst, Side side, Offset offset, Price px, Qty qty, Tif tif,
+                Nanos trigger_ts) {
+    RunnerIntent intent{};
+    intent.generation = 2;
+    intent.request_seq = 1;
+    intent.feed_seq = feed_seq;
+    intent.trigger_ts = trigger_ts;
+    intent.inst = inst;
+    intent.side = side;
+    intent.offset = offset;
+    intent.px = px;
+    intent.qty = qty;
+    intent.tif = tif;
+    return mailbox.intents.try_push(intent) ? 1 : kNoOrder;
+  }
+};
+
+struct IpcWorker {
+#if defined(_WIN32)
+  HANDLE handle = nullptr;
+#else
+  pid_t pid = -1;
+#endif
+};
+
+bool start_ipc_worker(const char* exe, const std::string& name, int index, IpcWorker& worker) {
+  const std::string id = std::to_string(index);
+#if defined(_WIN32)
+  std::string cmd = "\"" + std::string(exe) + "\" --account-ipc-worker " + name + " " + id;
+  STARTUPINFOA startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION proc{};
+  if (!::CreateProcessA(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                        &startup, &proc)) return false;
+  ::CloseHandle(proc.hThread);
+  worker.handle = proc.hProcess;
+#else
+  const pid_t pid = ::fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    ::execl(exe, exe, "--account-ipc-worker", name.c_str(), id.c_str(), nullptr);
+    ::_exit(127);
+  }
+  worker.pid = pid;
+#endif
+  return true;
+}
+
+bool join_ipc_worker(IpcWorker worker) {
+#if defined(_WIN32)
+  if (!worker.handle) return false;
+  DWORD code = 1;
+  const bool ok = ::WaitForSingleObject(worker.handle, 10'000) == WAIT_OBJECT_0 &&
+                  ::GetExitCodeProcess(worker.handle, &code) && code == 0;
+  ::CloseHandle(worker.handle);
+  return ok;
+#else
+  if (worker.pid < 0) return false;
+  int status = 0;
+  return ::waitpid(worker.pid, &status, 0) == worker.pid &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+template <typename F>
+bool wait_for_ipc(F&& ready) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!ready()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+}  // namespace
+
+int run_account_ipc_worker(const char* name, int index) {
+  auto mapping = AccountIpc::open(name, 1);
+  auto* state = mapping.get();
+  if (!state || index < 0 || index > 1) return 1;
+  Ring market(state->market);
+  Ring::Reader reader(market);
+  Envelope event;
+  auto& mailbox = state->mailbox[index];
+  const auto read_tick = [&] {
+    return wait_for_ipc([&] { return reader.poll(event).kind == Ring::PollKind::Msg; }) &&
+           event.is<MdSnapshotEvt>();
+  };
+  if (index == 0) {
+    if (!read_tick()) return 1;
+    RunnerIntent intent{};
+    intent.generation = 1;
+    intent.request_seq = 1;
+    intent.feed_seq = event.seq + 1;
+    intent.trigger_ts = event.ts;
+    intent.inst = event.as<MdSnapshotEvt>().inst;
+    intent.qty = 1;
+    intent.px = event.as<MdSnapshotEvt>().ask_px[0];
+    if (!mailbox.intents.try_push(intent)) return 1;
+    // The first worker stops processing before the second tick is sent.
+    return wait_for_ipc([&] { return state->stop.load(std::memory_order_acquire); }) ? 0 : 1;
+  }
+  MomentumIpcContext context{mailbox};
+  SnapMomentum strategy(2, 1, MomentumParams{}, context.table.size(), {0});
+  strategy.on_phase(context, PhaseChangeEvt{0, Venue::SHFE, Phase::Continuous});
+  for (int count = 0; count < 2; ++count) {
+    if (!read_tick()) return 1;
+    const auto& tick = event.as<MdSnapshotEvt>();
+    context.book.on_snapshot(tick);
+    context.feed_seq = event.seq + 1;
+    strategy.on_snapshot(context, tick);
+  }
+  if (!wait_for_ipc([&] { return mailbox.outcomes.front() && mailbox.reports.front(); }))
+    return 1;
+  const auto& result = *mailbox.outcomes.front();
+  auto report = *mailbox.reports.front();
+  if (result.status != IntentStatus::Processed || result.cl_id != report.cl_id ||
+      report.strategy != 2 || report.type != ExecType::Fill) return 1;
+  report.cl_id = result.request_seq;
+  strategy.on_exec(context, report);
+  return strategy.entries(0) == 1 ? 0 : 1;
+}
+
+void test_account_process_ipc(const char* exe) {
+  const std::string name = "plat-account-test-" + std::to_string(perf_now_ns());
+  auto mapping = AccountIpc::create(name, 1);
+  auto* state = mapping.get();
+  CHECK(state);
+  if (!state) return;
+  CHECK(!AccountIpc::open(name, 2).get());
+  IpcWorker workers[2];
+  const bool first_started = start_ipc_worker(exe, name, 0, workers[0]);
+  const bool second_started = first_started && start_ipc_worker(exe, name, 1, workers[1]);
+  CHECK(second_started);
+  if (!second_started) {
+    state->stop.store(true, std::memory_order_release);
+    if (first_started) join_ipc_worker(workers[0]);
+    return;
+  }
+  Ring market(state->market);
+  Ring::Reader account_feed(market);
+  Ring::Writer feed(market);
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.hosted = {0};
+  sc.journal_path = name + ".jnl";
+  FakeGateway counter;
+  using Engine = AccountEngine<FakeGateway>;
+  Engine engine(table, sc, Engine::Mode::Live, 1, kNsPerSec);
+  engine.set_gateway(&counter);
+  const auto now = at_time(9, 0, 1);
+  engine.source(SessionStateEvt{now, Venue::SHFE, SessState::Up}, now);
+  const bool armed = engine.arm_session(now);
+  CHECK(armed);
+  if (!armed) {
+    state->stop.store(true, std::memory_order_release);
+    join_ipc_worker(workers[1]);
+    join_ipc_worker(workers[0]);
+    return;
+  }
+  engine.source(PhaseChangeEvt{now, Venue::SHFE, Phase::Continuous}, now);
+  RunnerBinding runners[] = {{state->mailbox[0], 1, 1}, {state->mailbox[1], 2, 2}};
+  for (int i = 0; i < 2; ++i) {
+    const auto tick = snap(0, i + 1, now, 78'000 + i * 10, 78'010 + i * 10, 50, 10);
+    feed.publish(make_envelope(0, now, tick, Origin::Source, 1));
+    Envelope event;
+    const bool market_applied = account_feed.poll(event).kind == Ring::PollKind::Msg;
+    CHECK(market_applied);
+    if (!market_applied) break;
+    engine.source(event.as<MdSnapshotEvt>(), event.ts);
+    engine.market_applied(event.seq + 1);
+    CHECK(wait_for_ipc([&] { return engine.poll(runners[i], now); }));
+  }
+  CHECK(counter.placed.size() == 2);
+  if (counter.placed.size() == 2) {
+    CHECK(counter.placed[0].strategy == 1);
+    CHECK(counter.placed[1].strategy == 2);
+    const auto& order = counter.placed[1];
+    ExecReport fill{};
+    fill.cl_id = order.cl_id;
+    fill.ts = now;
+    fill.px = order.px;
+    fill.qty = fill.cum = order.qty;
+    fill.type = ExecType::Fill;
+    fill.offset = order.offset;
+    fill.side = order.side;
+    CHECK(engine.receive_report(fill, runners, now));
+  }
+  CHECK(join_ipc_worker(workers[1]));
+  state->stop.store(true, std::memory_order_release);
+  CHECK(join_ipc_worker(workers[0]));
+  CHECK(counter.cancels.empty());
+  engine.run_eod({}, 1, 0);
+  JournalReader journal;
+  const bool opened = journal.open(sc.journal_path);
+  CHECK(opened);
+  if (opened) {
+    Engine replay(table, sc, Engine::Mode::Replay, 1, kNsPerSec);
+    for (const auto& event : journal.envelopes()) replay.inject(event);
+    CHECK(replay.state_hash() == engine.state_hash());
+    CHECK(replay.stream().stream_hash() == engine.stream().stream_hash());
+  }
+  std::remove(sc.journal_path.c_str());
+}
+
+void test_shared_account_engine() {
+  hft::SpscRing<unsigned, 4> queue;
+  CHECK(queue.front() == nullptr);
+  CHECK(queue.can_push());
+  CHECK(queue.try_push(1));
+  CHECK(queue.try_push(2));
+  CHECK(queue.try_push(3));
+  CHECK(!queue.can_push());
+  CHECK(!queue.try_push(4));
+  if (const auto* pending = queue.front()) {
+    CHECK(*pending == 1 && queue.front() == pending);
+    queue.pop();
+  } else {
+    CHECK(false);
+  }
+  CHECK(queue.can_push() && queue.try_push(4));
+  unsigned item = 0;
+  for (unsigned expected = 2; expected <= 4; ++expected)
+    CHECK(queue.try_pop(item) && item == expected);
+  CHECK(!queue.try_pop(item));
+
+  using Engine = AccountEngine<FakeGateway>;
+  InstrumentTable table = one_future();
+  SiteConfig sc;
+  sc.hosted = {0};
+  const auto& inst = table.at(0);
+  const Price ask = px_from_cny(78'010.0);
+  sc.limits.max_net_notional_e4 = ask * inst.multiplier * 3 / 2;
+  auto first_mailbox = std::make_unique<RunnerMailbox>();
+  auto second_mailbox = std::make_unique<RunnerMailbox>();
+  RunnerBinding first{*first_mailbox, 10, 1};
+  RunnerBinding second{*second_mailbox, 20, 2};
+  FakeGateway counter;
+  Engine engine(table, sc, Engine::Mode::Live, 7, kNsPerSec);
+  engine.set_gateway(&counter);
+  const Nanos now = at_time(9, 0, 1);
+  engine.source(SessionStateEvt{now, Venue::SHFE, SessState::Up}, now);
+  CHECK(engine.arm_session(now));
+  engine.source(PhaseChangeEvt{now, Venue::SHFE, Phase::Continuous}, now);
+
+  RunnerIntent request{};
+  request.generation = 1;
+  request.request_seq = 1;
+  request.feed_seq = 1;
+  request.trigger_ts = now;
+  request.qty = 1;
+  request.px = ask;
+  request.tif = Tif::Ioc;
+  CHECK(first.mailbox.intents.try_push(request));
+  CHECK(!engine.poll(first, now));  // wait until the risk book includes the tick
+  engine.source(snap(0, 1, now, 78'000, 78'010, 50, 10), now);
+  engine.market_applied(1);
+  CHECK(engine.poll(first, now));
+  CHECK(counter.placed.size() == 1);
+  if (counter.placed.size() != 1) return;
+  const auto submitted = counter.placed.front();
+  CHECK(submitted.strategy == 10 && submitted.account == 7);
+  CHECK(submitted.tif == Tif::Ioc);
+  first.fenced = true;  // worker stopped making progress
+
+  request.generation = 2;
+  CHECK(second.mailbox.intents.try_push(request));
+  CHECK(engine.poll(second, now));
+  CHECK(counter.placed.size() == 1);
+  CHECK(engine.last_deny().check == RiskCheck::Exposure);
+  CHECK(engine.last_deny().strategy == 20);
+
+  // A stalled worker's order still reserves capacity and cannot be canceled
+  // by a different strategy. An unrelated eligible order can still proceed.
+  RunnerIntent cancel{};
+  cancel.action = RunnerAction::Cancel;
+  cancel.generation = 2;
+  cancel.request_seq = 2;
+  cancel.cancel_id = submitted.cl_id;
+  CHECK(second.mailbox.intents.try_push(cancel));
+  CHECK(engine.poll(second, now));
+  CHECK(counter.cancels.empty());
+  CHECK(engine.oms().find(submitted.cl_id)->open());
+  request.request_seq = 3;
+  request.side = Side::Sell;
+  request.px = ask + inst.tick;
+  CHECK(second.mailbox.intents.try_push(request));
+  CHECK(engine.poll(second, now));
+  CHECK(counter.placed.size() == 2);
+  if (counter.placed.size() == 2) CHECK(counter.placed.back().strategy == 20);
+}
 
 void test_site_loop() {
   InstrumentTable table = one_future();

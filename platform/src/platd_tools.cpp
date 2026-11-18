@@ -31,6 +31,8 @@ int run_check(const Config& cfg) {
   std::printf("  broker_id   = %s\n", cfg.str("broker_id").c_str());
   std::printf("  instruments = %s\n", cfg.str("instruments").c_str());
   std::printf("  journal     = %s\n", cfg.str("journal", "platd.jnl").c_str());
+  std::printf("  scheduler   = %s\n", cfg.flag("strategy_processes") ?
+              "one process per strategy (shared account)" : "inline");
   std::printf("  strategies  = %zu enabled\n", specs.size());
   for (const auto& s : specs)
     std::printf("    `%s` %s id %u account %u\n", s.name.c_str(), kind_name(s.kind), s.id,
@@ -57,6 +59,7 @@ std::unique_ptr<LiveSite> build_replay_site(const Config& cfg, const InstrumentT
   sc.limits = limits_from(cfg);
   sc.fees = fees_from(cfg);
   sc.epoch = static_cast<std::uint16_t>(cfg.i64("epoch", 1));
+  sc.shared_account_risk = cfg.flag("strategy_processes");
   for (InstrumentId i = 0; i < table.size(); ++i) sc.hosted.push_back(i);
   if (table.size()) sc.venue = table.at(0).venue;
   const auto account = static_cast<AccountId>(cfg.i64("account_id", 1));
@@ -71,7 +74,7 @@ std::unique_ptr<LiveSite> build_replay_site(const Config& cfg, const InstrumentT
   fp.build = build_fingerprint();
   fp.pack = Pack::fingerprint();
   fp.config = config_fingerprint(specs, sc.fees, table, sc.hosted,
-                                 sc.limits.max_actions_per_sec);
+                                 sc.limits.max_actions_per_sec, sc.shared_account_risk);
   fp.day = sc.day;
   fp.site = sc.id;
   SessionFingerprint recorded;
@@ -91,8 +94,9 @@ std::unique_ptr<LiveSite> build_replay_site(const Config& cfg, const InstrumentT
     logf("replay: note: no `.session` fingerprint beside the journal — composition not "
          "pre-verified (legacy record)\n");
   }
+  auto banks = sc.shared_account_risk ? Pack::Banks{} : Pack::banks(cfg, table, specs);
   return std::make_unique<LiveSite>(table, std::move(sc), LiveSite::Mode::Replay,
-                                    Pack::banks(cfg, table, specs));
+                                    std::move(banks));
 }
 
 }  // namespace

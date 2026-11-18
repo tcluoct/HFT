@@ -93,6 +93,8 @@ set(STRAT_SDK_HEADERS
 set(PLAT_HEADERS
   include/plat/bus/envelope.hpp
   include/plat/bus/ring.hpp
+  include/plat/bus/trade_ring.hpp
+  include/plat/bus/shared_channel.hpp
   include/plat/bus/stream.hpp
   include/plat/bus/journal.hpp
   include/plat/bus/async_journal.hpp
@@ -107,6 +109,7 @@ set(PLAT_HEADERS
   include/plat/comp/compliance.hpp
   include/plat/gw/gateway.hpp
   include/plat/engine/site.hpp
+  include/plat/engine/account.hpp
   include/plat/engine/site_dispatch.hpp
   include/plat/engine/site_state.hpp
   include/plat/engine/pack.hpp
@@ -166,6 +169,8 @@ set(PLATD_SOURCES
   src/platd_app.hpp
   src/platd_config.cpp
   src/platd_live.cpp
+  src/platd_workers.cpp
+  src/platd_workers.hpp
   src/platd_positions.cpp
   src/platd_fleet.cpp
   src/platd_tools.cpp
@@ -251,6 +256,7 @@ endif()
 # need a lineup link the desk on top.
 add_library(platform_lib STATIC src/plat_lib.cpp ${PLAT_HEADERS})
 target_link_libraries(platform_lib PUBLIC strat_sdk)  # include paths come with it
+target_include_directories(platform_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../seqbus/include)
 target_compile_definitions(platform_lib PUBLIC HFT_BUILD_ID="${HFT_BUILD_ID}")
 set_target_properties(platform_lib PROPERTIES FOLDER ${PROJECT_NAME})
 if(MSVC)

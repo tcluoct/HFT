@@ -194,6 +194,23 @@ void Site<Gateway, Strats...>::dispatch(const Envelope& e, Nanos order_prepare_b
     case Schema::ManualCancel:
       cancel(e.as<ManualCancelCmd>().cl_id);
       break;
+    case Schema::StrategyOrder: {
+      const auto& order = e.as<StrategyOrderCmd>();
+      dispatching_strategy_ = order.strategy;
+      dispatching_account_ = order.account;
+      last_strategy_cl_id_ = place(order.inst, order.side, order.offset, order.px, order.qty,
+                                    order.tif, order.trigger_ts);
+      dispatching_strategy_ = 0;
+      dispatching_account_ = 0;
+      break;
+    }
+    case Schema::StrategyCancel: {
+      const auto& request = e.as<StrategyCancelCmd>();
+      const OmsOrder* order = oms_.find(request.cl_id);
+      if (order && order->account == request.account && order->strategy == request.strategy)
+        cancel(request.cl_id);
+      break;
+    }
     case Schema::CarryIn: {
       // Startup inventory is a deterministic Source event: replay and the
       // platops mirror must rebuild the carried book + cost basis, not just
@@ -237,10 +254,15 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_new_order(const NewOrderReq& 
     if (mode_ == Mode::Live && gw_ && !recovering_ && trading_permitted()) {
       const auto sent = latency_.now();
       latency_.order_sent(r.cl_id, sent);
-      gw_->place(r);
+      SubmitResult submitted_result = SubmitResult::Accepted;
+      if constexpr (std::same_as<decltype(gw_->place(r)), SubmitResult>)
+        submitted_result = gw_->place(r);
+      else
+        gw_->place(r);
       const auto submitted = latency_.now();
       latency_.record(LatencyStage::GatewayNew, sent, submitted);
-      latency_.order_submitted(r.trigger_ts, submitted);
+      if (submitted_result == SubmitResult::Accepted)
+        latency_.order_submitted(r.trigger_ts, submitted);
     }
     ++*c_risk_pass_;
     comp_.on_new(r);
@@ -316,6 +338,9 @@ HFT_FORCE_INLINE void Site<Gateway, Strats...>::on_exec_report(const Envelope& e
 // so overflow is a logic error, not a load condition.
 template <OrderGateway Gateway, AnyStrategy... Strats>
 HFT_FORCE_INLINE void Site<Gateway, Strats...>::route(const Envelope& e) {
+  if (event_sink_ && !recovering_ &&
+      (e.is<PhaseChangeEvt>() || e.is<ExecReport>() || e.is<ParamUpdateEvt>()))
+    event_sink_(event_sink_ctx_, e);
   if (strat_depth_ > 0) {
     if (q_count_ < kStratQueueCap) [[likely]] {
       strat_q_[(q_head_ + q_count_++) & (kStratQueueCap - 1)] = e;

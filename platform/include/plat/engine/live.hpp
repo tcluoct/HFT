@@ -35,6 +35,7 @@
 
 #include "hft/common/platform.hpp"
 #include "plat/bus/ring.hpp"
+#include "plat/bus/trade_ring.hpp"
 #include "plat/core/log.hpp"
 #include "plat/core/phase.hpp"
 #include "plat/core/thread.hpp"
@@ -128,11 +129,11 @@ struct LiveOptions {
 template <typename SiteT>
 class LiveDriver {
  public:
-  LiveDriver(SiteT& site, Ring& md_ring, Ring& trade_ring,
+  LiveDriver(SiteT& site, Ring& md_ring, TradeRing& trade_ring,
              PhaseSchedule schedule, LiveOptions opt)
       : site_(&site),
         md_reader_(md_ring, /*from_origin=*/true, Ring::LossPolicy::Tolerant),
-        trade_reader_(trade_ring, /*from_origin=*/true, Ring::LossPolicy::Intolerant),
+        trade_ring_(trade_ring),
         schedule_(schedule), opt_(opt) {
     site.set_timer_sink(&LiveDriver::timer_thunk, this);
     site.set_latency_clock(&live_now_ns);
@@ -181,6 +182,7 @@ class LiveDriver {
       did_work |= fire_phases(now);
       did_work |= fire_timers(now);
       did_work |= process_console(now);
+      if (worker_poll_) did_work |= worker_poll_(worker_ctx_, now);
       maybe_snapshot(now);
 
       if (!site_->journal_healthy() && !journal_faulted_) {
@@ -215,6 +217,12 @@ class LiveDriver {
   void set_eod_query(EodQueryFn fn, void* ctx) {
     eod_fn_ = fn;
     eod_ctx_ = ctx;
+  }
+
+  using WorkerPoll = bool (*)(void*, Nanos);
+  void set_worker_poll(WorkerPoll fn, void* ctx) {
+    worker_poll_ = fn;
+    worker_ctx_ = ctx;
   }
 
   // Live risk-limit reload (`reload`): main owns the config path/shard overlay,
@@ -252,12 +260,18 @@ class LiveDriver {
       if (p.kind == Ring::PollKind::Gap) {
         logf("[drv] md ring lapped, lost %llu (books re-baseline)\n",
                      static_cast<unsigned long long>(p.gap));
+        if (worker_poll_) {
+          logf("[drv] shared market-data gap — account entry blocked pending restart\n");
+          site_->block_trading();
+        }
         continue;
       }
       if (e.is<MdSnapshotEvt>()) site_->source(e.as<MdSnapshotEvt>(), e.ts, received);
       else if (e.is<MdOrderEvt>()) site_->source(e.as<MdOrderEvt>(), e.ts, received);
       else if (e.is<MdTradeEvt>()) site_->source(e.as<MdTradeEvt>(), e.ts, received);
       else if (e.is<FeedGapEvt>()) site_->source(e.as<FeedGapEvt>(), e.ts, received);
+      if constexpr (requires { site_->market_applied(e.seq + 1); })
+        site_->market_applied(e.seq + 1);
       any = true;
     }
     return any;
@@ -265,24 +279,27 @@ class LiveDriver {
 
   bool drain_trade_ring() {
     bool any = false;
+    TradeEvent event;
     for (;;) {
-      Envelope e;
-      Nanos received = 0;
-      const auto p = trade_reader_.poll(e, &received);
-      if (p.kind == Ring::PollKind::Empty) break;
-      if (p.kind == Ring::PollKind::Fault) {
+      const auto result = trade_ring_.poll(event);
+      if (result == TradeRing::Poll::Empty) break;
+      if (result == TradeRing::Poll::Fault) {
         // Exec-report loss: order state is no longer trustworthy (§7.1).
         if (!trade_faulted_) {
           trade_faulted_ = true;
           logf("[drv] TRADE RING FAULT — halting site\n");
+          site_->block_trading();
           site_->command_kill(KillScope::Site, KillAction::Halt, 0, live_now_ns());
         }
         break;
       }
-      if (e.is<ExecReport>()) site_->source(e.as<ExecReport>(), e.ts, received);
-      else if (e.is<SessionStateEvt>()) {
-        const auto st = e.as<SessionStateEvt>().state;
-        site_->source(e.as<SessionStateEvt>(), e.ts, received);
+      if (event.kind == TradeEvent::Kind::Report) {
+        const auto& report = event.report;
+        site_->source(report, report.ts, report.ts);
+      } else {
+        const auto& session = event.session;
+        const auto st = session.state;
+        site_->source(session, session.ts, session.ts);
         // Session loss is a trading emergency, not a transient: halt and stay
         // halted until an operator has reviewed the venue state and re-arms.
         // A reconnect is *not* proof that working orders and fills are
@@ -508,8 +525,10 @@ class LiveDriver {
   }
 
   SiteT* site_;
+  WorkerPoll worker_poll_ = nullptr;
+  void* worker_ctx_ = nullptr;
   Ring::Reader md_reader_;
-  Ring::Reader trade_reader_;
+  TradeRing& trade_ring_;
   PhaseSchedule schedule_;
   LiveOptions opt_;
   std::size_t phase_idx_ = 0;

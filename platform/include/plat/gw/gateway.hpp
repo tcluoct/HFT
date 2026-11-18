@@ -27,9 +27,12 @@
 
 namespace plat {
 
+enum class SubmitResult : std::uint8_t { Accepted, Failed, Ambiguous };
+
 template <typename G>
 concept OrderGateway = requires(G g, const G cg, const NewOrderReq& r, const CancelReq& c) {
-  g.place(r);
+  requires std::same_as<decltype(g.place(r)), void> ||
+           std::same_as<decltype(g.place(r)), SubmitResult>;
   g.cancel(c);
   { cg.state() } -> std::same_as<SessState>;
 };

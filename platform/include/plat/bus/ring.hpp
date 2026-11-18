@@ -15,6 +15,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <vector>
 
 #include "hft/common/platform.hpp"
@@ -45,15 +46,35 @@ class Ring {
   static_assert(sizeof(Slot) == hft::kCacheLine + sizeof(Envelope));
   static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
+  struct alignas(hft::kCacheLine) Cursor {
+    std::atomic<std::uint64_t> published{0};
+  };
+
+  template <std::size_t Capacity>
+  struct SharedStorage {
+    static_assert(std::has_single_bit(Capacity));
+    Cursor cursor;
+    Slot slots[Capacity];
+  };
+
   // Power-of-two capacity keeps slot addressing a mask. Slots hold atomics
   // (immovable), so the vector is sized exactly once and never reallocated.
   explicit Ring(std::uint64_t capacity)
-      : slots_(std::has_single_bit(capacity) ? capacity : std::bit_ceil(capacity)),
-        mask_(slots_.size() - 1) {}
+      : owned_slots_(std::has_single_bit(capacity) ? capacity : std::bit_ceil(capacity)),
+        slots_(owned_slots_), mask_(slots_.size() - 1), cursor_(&owned_cursor_) {}
+
+  // The mapped storage is constructed by its owner before readers attach.
+  template <std::size_t Capacity>
+  explicit Ring(SharedStorage<Capacity>& storage) noexcept
+      : slots_(storage.slots), mask_(Capacity - 1), cursor_(&storage.cursor) {}
+
+  Ring(const Ring&) = delete;
+  Ring& operator=(const Ring&) = delete;
 
   class Writer {
    public:
-    explicit Writer(Ring& r) noexcept : r_(&r) {}
+    explicit Writer(Ring& r) noexcept
+        : r_(&r), seq_(r.cursor_->published.load(std::memory_order_acquire)) {}
 
     HFT_FORCE_INLINE std::uint64_t publish(const Envelope& e, Nanos receive_ns = 0) noexcept {
       const std::uint64_t s = seq_++;
@@ -67,7 +88,7 @@ class Ring {
         sl.word[i].store(w[i], std::memory_order_relaxed);
       sl.receive_ns.store(receive_ns, std::memory_order_relaxed);
       sl.stamp.store(2 * s + 2, std::memory_order_release);  // payload before done
-      r_->pub_seq_.store(s + 1, std::memory_order_release);
+      r_->cursor_->published.store(s + 1, std::memory_order_release);
       return s;
     }
 
@@ -94,7 +115,7 @@ class Ring {
    public:
     explicit Reader(Ring& r, bool from_origin = true,
                     LossPolicy policy = LossPolicy::Tolerant) noexcept
-        : r_(&r), next_(from_origin ? 0 : r.pub_seq_.load(std::memory_order_acquire)),
+        : r_(&r), next_(from_origin ? 0 : r.cursor_->published.load(std::memory_order_acquire)),
           policy_(policy) {}
 
     HFT_FORCE_INLINE Poll poll(Envelope& out, Nanos* receive_ns = nullptr) noexcept {
@@ -117,7 +138,7 @@ class Ring {
         }
       }
       // Lapped: the hole is real data loss.
-      const std::uint64_t pub = r_->pub_seq_.load(std::memory_order_acquire);
+      const std::uint64_t pub = r_->cursor_->published.load(std::memory_order_acquire);
       const std::uint64_t lost = pub - next_;
       dropped_ += lost;
       if (policy_ == LossPolicy::Intolerant) {
@@ -140,9 +161,11 @@ class Ring {
   };
 
  private:
-  std::vector<Slot> slots_;
+  std::vector<Slot> owned_slots_;
+  Cursor owned_cursor_;
+  std::span<Slot> slots_;
   std::uint64_t mask_;
-  alignas(hft::kCacheLine) std::atomic<std::uint64_t> pub_seq_{0};
+  Cursor* cursor_;
 };
 
 }  // namespace plat

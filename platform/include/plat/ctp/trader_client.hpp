@@ -14,10 +14,10 @@
 //     tens of entries, hundreds of actions/day by design — riskgate's rate
 //     cap sits far below any contention level).
 //   · All outcomes — venue reports and local bounces alike — are published
-//     to one broadcast ring through one mutex-serialized writer, so the
+//     to the trade ring through one mutex-serialized producer, so the
 //     engine sees a single FIFO report stream (the session-FIFO contract: a
-//     fill can never arrive after its IOC's cancel-remainder). The ring is
-//     single-writer/multi-reader; the engine is its one trading consumer.
+//     fill can never arrive after its IOC's cancel-remainder). The engine
+//     is the sole consumer.
 //   · Startup/EOD queries are synchronous helpers with the CTP 1-flow/sec
 //     query throttle respected by the caller (main/driver, never the engine
 //     loop).
@@ -36,7 +36,7 @@
 #include <vector>
 
 #include "ThostFtdcTraderApi.h"
-#include "plat/bus/ring.hpp"
+#include "plat/bus/trade_ring.hpp"
 #include "plat/core/log.hpp"
 #include "plat/codec/msgs.hpp"
 #include "plat/core/types.hpp"
@@ -122,8 +122,8 @@ class TraderClient final : public CThostFtdcTraderSpi {
  public:
   using NowFn = Nanos (*)();
 
-  TraderClient(TraderConfig cfg, Ring& out, NowFn now_fn)
-      : cfg_(std::move(cfg)), writer_(out), now_(now_fn) {}
+  TraderClient(TraderConfig cfg, TradeRing& out, NowFn now_fn)
+      : cfg_(std::move(cfg)), trade_ring_(out), now_(now_fn) {}
   TraderClient(const TraderClient&) = delete;
   TraderClient& operator=(const TraderClient&) = delete;
   ~TraderClient() { stop(); }
@@ -143,7 +143,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
 
   // ------------------------------------------------------------ order entry
 
-  void place(const NewOrderReq& r);
+  SubmitResult place(const NewOrderReq& r);
 
   void cancel(const CancelReq& c);
 
@@ -300,7 +300,7 @@ class TraderClient final : public CThostFtdcTraderSpi {
   void finish_query();
 
   TraderConfig cfg_;
-  Ring::Writer writer_;
+  TradeRing& trade_ring_;
   NowFn now_;
   CThostFtdcTraderApi* api_ = nullptr;
 

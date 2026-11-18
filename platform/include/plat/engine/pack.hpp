@@ -36,7 +36,7 @@
 #include "plat/core/config.hpp"
 #include "plat/core/log.hpp"
 #include "plat/core/types.hpp"
-#include "plat/engine/site.hpp"
+#include "plat/engine/account.hpp"
 #include "plat/ref/instrument.hpp"
 
 namespace plat {
@@ -106,6 +106,9 @@ struct StratPack {
   // or more configured instances of that type).
   template <typename Gateway>
   using SiteFor = Site<Gateway, typename Defs::Strat...>;
+
+  template <typename Gateway>
+  using AccountFor = AccountEngine<Gateway, typename Defs::Strat...>;
 
   // What SiteFor's constructor takes: one instance vector per type, in pack
   // order — the order banks are dispatched, saved and hashed (site_state.hpp),

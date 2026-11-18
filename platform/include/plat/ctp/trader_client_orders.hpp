@@ -33,10 +33,10 @@ inline bool TraderClient::wait_until_up(int timeout_ms) {
                             [this] { return state_ == SessState::Up; });
 }
 
-inline void TraderClient::place(const NewOrderReq& r) {
+inline SubmitResult TraderClient::place(const NewOrderReq& r) {
   if (state() != SessState::Up) {
     bounce_new(r, ExecReason::SessionDown);
-    return;
+    return SubmitResult::Failed;
   }
   const std::uint64_t seq = r.cl_id & 0xFFFF'FFFF'FFFFull;
   OrderCtx ctx{};
@@ -52,7 +52,7 @@ inline void TraderClient::place(const NewOrderReq& r) {
   const InstrumentWire* w = wire_for(r.inst);
   if (!w) {
     bounce_new(r, ExecReason::UnknownOrder);
-    return;
+    return SubmitResult::Failed;
   }
   std::snprintf(ctx.symbol, sizeof(ctx.symbol), "%s", w->symbol);
   std::snprintf(ctx.exchange, sizeof(ctx.exchange), "%s", w->exchange);
@@ -82,7 +82,9 @@ inline void TraderClient::place(const NewOrderReq& r) {
   f.IsAutoSuspend = 0;
   f.UserForceClose = 0;
 
-  if (api_->ReqOrderInsert(&f, ++req_id_) != 0) bounce_new(r, ExecReason::SessionDown);
+  if (api_->ReqOrderInsert(&f, ++req_id_) == 0) return SubmitResult::Accepted;
+  bounce_new(r, ExecReason::SessionDown);
+  return SubmitResult::Failed;
 }
 
 inline void TraderClient::cancel(const CancelReq& c) {
@@ -409,7 +411,7 @@ inline void TraderClient::cancel_reject_by_ref(const char* order_ref) {
 
 inline void TraderClient::publish_report(const ExecReport& r) {
   std::lock_guard lk(ring_mtx_);
-  writer_.publish(make_envelope(0, r.ts, r, Origin::Source, 0), r.ts);
+  trade_ring_.publish(TradeEvent{r});
 }
 
 inline void TraderClient::set_state(SessState s) {
@@ -424,7 +426,7 @@ inline void TraderClient::set_state(SessState s) {
   e.venue = Venue::SHFE;  // session is per-counter, not per-venue; tag is cosmetic
   e.state = s;
   std::lock_guard lk(ring_mtx_);
-  writer_.publish(make_envelope(0, e.ts, e, Origin::Source, 0), e.ts);
+  trade_ring_.publish(TradeEvent{e});
 }
 
 }  // namespace plat::ctp

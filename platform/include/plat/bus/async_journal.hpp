@@ -123,6 +123,9 @@ class AsyncJournal {
     std::uint64_t messages = 0;
     Nanos last_sync = perf_now_ns();
     for (;;) {
+      // Read the shutdown request before polling. Once it is visible, all
+      // final producer publishes precede the poll that can end the drain.
+      const bool stopping = stop_.load(std::memory_order_acquire);
       Nanos enqueued = 0;
       const auto p = reader.poll(e, &enqueued);
       switch (p.kind) {
@@ -176,7 +179,7 @@ class AsyncJournal {
         last_sync = now;
         unsynced = false;
       }
-      if (stop_.load(std::memory_order_acquire)) return;  // drained + stopping
+      if (stopping) return;  // drained after observing the final publish
       // Journal latency is not tick latency: sleep, don't burn a core.
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }

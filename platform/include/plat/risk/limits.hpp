@@ -20,7 +20,7 @@ struct RiskLimits {
   Qty max_order_qty = 10'000;           // futures lots per order (#3)
   Qty max_stock_order_qty = 100'000;    // shares per stock order (#3); the board max (#17) also applies
   std::int64_t max_order_notional_e4 = px_from_cny(2'000'000.0);  // 200万 per order
-  std::int64_t max_net_notional_e4 = px_from_cny(10'000'000.0);   // per strategy
+  std::int64_t max_net_notional_e4 = px_from_cny(10'000'000.0);   // account or inline strategy
   std::int64_t max_margin_e4 = px_from_cny(5'000'000.0);          // per account
   std::uint32_t max_actions_per_sec = 250;   // below the 300/s HFT line by default
   std::uint32_t max_actions_per_day = 18'000;
